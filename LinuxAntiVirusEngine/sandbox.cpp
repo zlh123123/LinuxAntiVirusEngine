@@ -1,0 +1,1459 @@
+#include "sandbox.h"
+#include "sandbox_callbacks.h"
+#include "sandbox_api_com.h"
+
+// 在文件开头添加AllocateMemory函数的声明
+auto Sandbox::AllocateMemory(size_t size) -> uint64_t {
+    // 使用一个简单的内存分配策略
+    static uint64_t next_address = 0x60000000;  // 起始地址
+    uint64_t allocated_address = next_address;
+
+    // 对齐到4KB
+    size = (size + 0xFFF) & ~0xFFF;
+
+    // 分配内存
+    uc_err err = uc_mem_map(m_ucEngine, allocated_address, size, UC_PROT_ALL);
+    if (err != UC_ERR_OK) {
+        printf("[!] Failed to allocate memory at 0x%llx: %u\n",
+               allocated_address, err);
+        return 0;
+    }
+
+    // 更新下一个可用地址
+    next_address += size + 0x1000;  // 添加一个页面的间隔
+    return allocated_address;
+}
+
+std::string getDllNameFromApiSetMap(const std::string& apiSet) {
+    const std::wstring wApiSet(apiSet.begin(), apiSet.end());
+
+    // 获取系统版本信息
+    using RtlGetVersionFunc = LONG(__stdcall*)(PRTL_OSVERSIONINFOW);
+    const auto pRtlGetVersion = reinterpret_cast<RtlGetVersionFunc>(
+        GetProcAddress(LoadLibraryA("ntdll.dll"), "RtlGetVersion"));
+
+    RTL_OSVERSIONINFOEXW verInfo{};
+    verInfo.dwOSVersionInfoSize = sizeof(verInfo);
+    pRtlGetVersion(reinterpret_cast<PRTL_OSVERSIONINFOW>(&verInfo));
+
+    const ULONG verShort = (verInfo.dwMajorVersion << 8) |
+                           (verInfo.dwMinorVersion << 4) |
+                           verInfo.wServicePackMajor;
+
+    if (verShort >= static_cast<ULONG>(WinVer::kWin10)) {
+        const auto apiSetMap = reinterpret_cast<API_SET_NAMESPACE_ARRAY_10*>(
+            reinterpret_cast<X64PEB*>(__readgsqword(0x60))->ApiSetMap);
+        const auto apiSetMapAsNumber = reinterpret_cast<ULONG_PTR>(apiSetMap);
+        auto nsEntry = reinterpret_cast<PAPI_SET_NAMESPACE_ENTRY_10>(
+            apiSetMap->Start + apiSetMapAsNumber);
+
+        // 遍历API集合查找匹配项
+        for (ULONG i = 0; i < apiSetMap->Count; i++) {
+            UNICODE_STRING nameString{}, valueString{};
+            nameString.MaximumLength = static_cast<USHORT>(nsEntry->NameLength);
+            nameString.Length = static_cast<USHORT>(nsEntry->NameLength);
+            nameString.Buffer = reinterpret_cast<PWCHAR>(apiSetMapAsNumber +
+                                                         nsEntry->NameOffset);
+
+            const std::wstring name(nameString.Buffer,
+                                    nameString.Length / sizeof(WCHAR));
+            const std::wstring fullName = name + L".dll";
+
+            if (_wcsicmp(wApiSet.c_str(), fullName.c_str()) == 0) {
+                if (nsEntry->ValueCount == 0) {
+                    return "";
+                }
+
+                const auto valueEntry =
+                    reinterpret_cast<PAPI_SET_VALUE_ENTRY_10>(
+                        apiSetMapAsNumber + nsEntry->ValueOffset);
+                valueString.Buffer = reinterpret_cast<PWCHAR>(
+                    apiSetMapAsNumber + valueEntry->ValueOffset);
+                valueString.MaximumLength =
+                    static_cast<USHORT>(valueEntry->ValueLength);
+                valueString.Length =
+                    static_cast<USHORT>(valueEntry->ValueLength);
+
+                const std::wstring value(valueString.Buffer,
+                                         valueString.Length / sizeof(WCHAR));
+                return {value.begin(), value.end()};
+            }
+            ++nsEntry;
+        }
+    } else {
+        // 不支持Windows 10以下版本
+        throw std::runtime_error("Unsupported Windows version");
+    }
+    return "";
+}
+
+class ImportResolver : public peconv::t_function_resolver {
+   public:
+    explicit ImportResolver(std::map<std::string, uint64_t> context)
+        : _functionMap(std::move(context)) {}
+
+    FARPROC resolve_func(LPSTR libName, LPSTR funcName) override {
+        return reinterpret_cast<FARPROC>(_functionMap[std::string(funcName)]);
+    }
+
+   private:
+    std::map<std::string, uint64_t> _functionMap;
+};
+
+class cListImportNames : public peconv::ImportThunksCallback {
+   public:
+    cListImportNames(
+        BYTE* _modulePtr, size_t _moduleSize,
+        std::vector<std::shared_ptr<moudle_import>>& name_to_addr,
+        std::vector<std::shared_ptr<moudle_import_ordinal>>& name_to_ordinal)
+        : ImportThunksCallback(_modulePtr, _moduleSize),
+          nameToAddr(name_to_addr),
+          ordinalImportFunc(name_to_ordinal) {}
+
+    virtual bool processThunks(LPSTR lib_name, ULONG_PTR origFirstThunkPtr,
+                               ULONG_PTR firstThunkPtr) {
+        if (this->is64b) {
+            IMAGE_THUNK_DATA64* desc =
+                reinterpret_cast<IMAGE_THUNK_DATA64*>(origFirstThunkPtr);
+            ULONGLONG* call_via = reinterpret_cast<ULONGLONG*>(firstThunkPtr);
+            return processThunks_tpl<ULONGLONG, IMAGE_THUNK_DATA64>(
+                lib_name, desc, call_via, IMAGE_ORDINAL_FLAG64);
+        }
+        IMAGE_THUNK_DATA32* desc =
+            reinterpret_cast<IMAGE_THUNK_DATA32*>(origFirstThunkPtr);
+        DWORD* call_via = reinterpret_cast<DWORD*>(firstThunkPtr);
+        return processThunks_tpl<DWORD, IMAGE_THUNK_DATA32>(
+            lib_name, desc, call_via, IMAGE_ORDINAL_FLAG32);
+    }
+
+   protected:
+    template <typename T_FIELD, typename T_IMAGE_THUNK_DATA>
+    bool processThunks_tpl(LPSTR lib_name, T_IMAGE_THUNK_DATA* desc,
+                           T_FIELD* call_via, T_FIELD ordinal_flag) {
+        DWORD call_via_rva = static_cast<DWORD>((ULONG_PTR)call_via -
+                                                (ULONG_PTR)this->modulePtr);
+        LPSTR func_name = NULL;
+        if ((desc->u1.Ordinal & ordinal_flag) == 0) {
+            PIMAGE_IMPORT_BY_NAME by_name =
+                (PIMAGE_IMPORT_BY_NAME)((ULONGLONG)modulePtr +
+                                        desc->u1.AddressOfData);
+            func_name = reinterpret_cast<LPSTR>(by_name->Name);
+            std::string fuck_up_api_ms = lib_name;
+            if (fuck_up_api_ms.find("api-ms-") != std::string::npos) {
+                fuck_up_api_ms = getDllNameFromApiSetMap(fuck_up_api_ms);
+                if (fuck_up_api_ms.size() <= 1) __debugbreak();
+            }
+            auto import_data = std::make_shared<moudle_import>();
+            memcpy(import_data->name, func_name, strlen(func_name));
+            memcpy(import_data->dll_name, fuck_up_api_ms.c_str(),
+                   fuck_up_api_ms.size());
+            import_data->function_address = call_via_rva;
+            import_data->is_delayed_import = false;
+            nameToAddr.push_back(import_data);
+        } else {
+            auto importFunc = std::make_shared<moudle_import_ordinal>();
+            T_FIELD raw_ordinal = desc->u1.Ordinal & (~ordinal_flag);
+            importFunc->dll_name = lib_name;
+            importFunc->function_address = call_via_rva;
+            importFunc->ordinal = raw_ordinal;
+            ordinalImportFunc.push_back(importFunc);
+        }
+        return true;
+    }
+
+    std::vector<std::shared_ptr<moudle_import>>& nameToAddr;
+    std::vector<std::shared_ptr<moudle_import_ordinal>>& ordinalImportFunc;
+};
+class cFixImprot : public peconv::t_function_resolver {
+   public:
+    // 构造函数接收Sandbox实例的引用
+    explicit cFixImprot(Sandbox* sandbox) : m_sandbox(sandbox) {}
+
+    // 实现导入函数解析
+    virtual FARPROC resolve_func(LPSTR lib_name, LPSTR func_name) override {
+        // 遍历所有已加载的模块
+        for (const auto& module : m_sandbox->m_moduleList) {
+            // 检查模块名是否匹配
+            if (_stricmp(module->name, lib_name) == 0) {
+                // 遍历该模块的导出函数
+                for (const auto& exp : module->export_function) {
+                    // 检查函数名是否匹配
+                    if (strcmp(exp->name, func_name) == 0) {
+                        auto newBase = reinterpret_cast<FARPROC>(
+                            module->base + exp->function_address);
+#ifdef LOG_LEVEL > 2
+                        printf("fix import: %s => %llx \n", func_name, newBase);
+                        // 返回在模拟器中的虚拟地址
+#endif
+                        return newBase;
+                    }
+                }
+            }
+        }
+
+        // 如果没有找到精确匹配的模块名，尝试在所有模块中查找该函数
+        for (const auto& module : m_sandbox->m_moduleList) {
+            for (const auto& exp : module->export_function) {
+                auto newBase = reinterpret_cast<FARPROC>(
+                    module->base + exp->function_address);
+                // 检查函数名是否匹配
+                if (strcmp(exp->name, func_name) == 0) {
+#ifdef LOG_LEVEL > 1
+                    printf("fix import (fallback): %s found in %s => %llx \n",
+                           func_name, module->name, newBase);
+                    // 返回在模拟器中的虚拟地址
+#endif
+                    return newBase;
+                }
+                //序号导出,非常癌症的修复.
+
+                if (strcmp(module->name, lib_name) == 0) {
+                    int ordinalNum = std::atoi(func_name);
+                    if (exp->ordinal == ordinalNum) {
+                        auto newBase = reinterpret_cast<FARPROC>(
+                            module->base + exp->function_address);
+#ifdef LOG_LEVEL > 1
+                        printf("fix import (ordianal): %s found in [%s]%s => %llx \n",
+                            func_name, module->name, exp->name, newBase);
+                        // 返回在模拟器中的虚拟地址
+#endif // LOG_LEVEL > 1
+                        return newBase;
+                    }
+                }
+
+            }
+        }
+
+        printf("Warning: Could not resolve import: %s from library: %s\n",
+               func_name, lib_name);
+        //__debugbreak();
+        return nullptr;
+    }
+
+   private:
+    Sandbox* m_sandbox;  // Sandbox实例的指针
+};
+Sandbox::Sandbox() {
+    m_ucEngine = nullptr;
+    m_peInfo = nullptr;
+    m_nextWfpEngineHandle = (HANDLE)0x1000;  // 初始化WFP引擎句柄
+    m_lastImpRead = {0, 0};
+}
+
+Sandbox::~Sandbox() {
+    // 清理WFP引擎资源
+    for (auto& pair : m_wfpEngines) {
+        delete pair.second;
+    }
+    m_wfpEngines.clear();
+
+    // 1. 先清理高层资源
+    m_crossSectionExecution.clear();
+    envStrings.clear();
+    api_map.clear();
+    m_moduleList.clear();
+    m_impFuncDict.clear();
+    m_exportFuncDict.clear();
+
+    // 2. 清理内存映射
+    if (m_ucEngine) {
+        uc_close(m_ucEngine);
+        m_ucEngine = nullptr;
+    }
+
+    // 3. 清理堆内存
+    for (auto& [address, segment] : m_heapSegments) {
+        HeapBlock* current = segment->blocks;
+        while (current) {
+            HeapBlock* next = current->next;
+            delete current;
+            current = next;
+        }
+        delete segment;
+    }
+    m_heapSegments.clear();
+
+    // 5. 最后清理底层资源
+    if (m_csHandle) {
+        cs_close(&m_csHandle);
+    }
+}
+
+auto Sandbox::PushModuleToVM(const char* dllName, uint64_t moduleBase) -> void {
+    for (auto module : m_moduleList) {
+        if (module->real_base == moduleBase) {
+            printf("skip module name: %s (already loaded)\n", module->name);
+            return;
+        }
+    }
+    if (m_usedModuleBase == 0) {
+        m_usedModuleBase = DLL_MODULE_BASE;
+    }
+    // 创建新模块
+    auto newModule =
+        CreateModuleInfo(dllName, AlignSize(m_usedModuleBase, PAGE_SIZE),
+                         moduleBase, moduleBase);
+
+    m_usedModuleBase += PAGE_SIZE + newModule->size;
+    m_moduleList.push_back(newModule);
+    printf("push `%s` module to vm base: %llx vm size: %llx\n", newModule->name,
+           newModule->base, newModule->size);
+    if (uc_mem_map(m_ucEngine, newModule->base, newModule->size,
+                   UC_PROT_READ | UC_PROT_EXEC) != UC_ERR_OK) {
+        throw std::runtime_error("Failed to map module");
+    }
+    if (uc_mem_write(m_ucEngine, newModule->base, (void*)moduleBase,
+                     newModule->size) != UC_ERR_OK) {
+        throw std::runtime_error("Failed to write data to map module");
+    }
+    if (peconv::relocate_module((BYTE*)moduleBase, newModule->size,
+                                newModule->base) == false) {
+        throw std::runtime_error("Failed to relocate module");
+    }
+
+    // 将模块添加到LDR链表中
+    if (m_peInfo->isX64) {
+        AddModuleToLdr(newModule);
+    }
+}
+
+auto Sandbox::CreateModuleInfo(const char* dllName, uint64_t moduleBase,
+                               uint64_t realModuleBase, uint64_t bufferAddress)
+    -> std::shared_ptr<struct_moudle> {
+    // 解析PE头
+    auto* dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(bufferAddress);
+    auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<LPBYTE>(bufferAddress) + dosHeader->e_lfanew);
+
+    // 获取区段对齐值
+    DWORD sectionAlignment =
+        (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64)
+            ? reinterpret_cast<PIMAGE_NT_HEADERS64>(ntHeaders)
+                  ->OptionalHeader.SectionAlignment
+            : ntHeaders->OptionalHeader.SectionAlignment;
+
+    // 获取区段头
+    auto* sectionHeader = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+        reinterpret_cast<PUCHAR>(ntHeaders) + sizeof(ntHeaders->Signature) +
+        sizeof(ntHeaders->FileHeader) +
+        ntHeaders->FileHeader.SizeOfOptionalHeader);
+
+    struct_moudle newModule{};
+    strncpy(newModule.name, dllName, strlen(dllName));
+    newModule.base = moduleBase;
+    newModule.real_base = realModuleBase;
+    newModule.entry = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    newModule.size = ntHeaders->OptionalHeader.SizeOfImage;
+    // 处理区段
+    for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        const auto& section = sectionHeader[i];
+
+        // if (!(section.Characteristics &
+        //       (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE))) {
+        //     continue;
+        // }
+
+        // 设置区段保护属性
+        int protection = UC_PROT_READ;
+        if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            protection |= UC_PROT_EXEC;
+        if (section.Characteristics & IMAGE_SCN_MEM_WRITE)
+            protection |= UC_PROT_WRITE;
+
+        // 计算区段大小
+        auto sectionSize = AlignToSectionAlignment(
+            max(section.Misc.VirtualSize, section.SizeOfRawData),
+            sectionAlignment);
+
+        // 创建区段信息
+        moudle_section newSection{};
+        strncpy(newSection.name, reinterpret_cast<const char*>(section.Name),
+                8);
+        newSection.base = section.VirtualAddress;
+        newSection.size = sectionSize;
+        newSection.protect_flag = protection;
+
+        newModule.sections.push_back(
+            std::make_shared<moudle_section>(newSection));
+        std::cout << "[PE] " << dllName << " Section found: " << newSection.name
+                  << '\n';
+    }
+
+    return std::make_shared<struct_moudle>(newModule);
+}
+
+auto Sandbox::ResolveExport(uint64_t moduleBase)
+    -> std::vector<std::shared_ptr<moudle_export>> {
+    std::vector<std::shared_ptr<moudle_export>> export_list;
+    DWORD exportSize = 0;
+    static RtlImageDirectoryEntryToDataFn fnRtlImageDirectoryEntryToData;
+    if (fnRtlImageDirectoryEntryToData == nullptr) {
+        fnRtlImageDirectoryEntryToData =
+            reinterpret_cast<RtlImageDirectoryEntryToDataFn>(GetProcAddress(
+                GetModuleHandleA("ntdll.dll"), "RtlImageDirectoryEntryToData"));
+    }
+    // 获取导出表
+    PIMAGE_EXPORT_DIRECTORY exportDirectory =
+        static_cast<PIMAGE_EXPORT_DIRECTORY>(fnRtlImageDirectoryEntryToData(
+            reinterpret_cast<PUCHAR>(moduleBase), TRUE,
+            IMAGE_DIRECTORY_ENTRY_EXPORT, &exportSize));
+
+    if (exportDirectory) {
+        const DWORD numberOfNames = exportDirectory->NumberOfNames;
+        PDWORD addressOfFunctions =
+            reinterpret_cast<PDWORD>(reinterpret_cast<PUCHAR>(moduleBase) +
+                                     exportDirectory->AddressOfFunctions);
+        PDWORD addressOfNames =
+            reinterpret_cast<PDWORD>(reinterpret_cast<PUCHAR>(moduleBase) +
+                                     exportDirectory->AddressOfNames);
+        PWORD addressOfNameOrdinals =
+            reinterpret_cast<PWORD>(reinterpret_cast<PUCHAR>(moduleBase) +
+                                    exportDirectory->AddressOfNameOrdinals);
+
+        // 遍历导出函数
+        for (size_t i = 0; i < numberOfNames; i++) {
+            PCHAR functionName = reinterpret_cast<PCHAR>(
+                reinterpret_cast<PUCHAR>(moduleBase) + addressOfNames[i]);
+
+            // 获取函数RVA
+            const DWORD functionRva =
+                addressOfFunctions[addressOfNameOrdinals[i]];
+
+            // 创建导出数据结构
+            moudle_export exportData{};
+            memcpy(exportData.name, functionName, strlen(functionName));
+            exportData.function_address = functionRva;
+            exportData.ordinal = static_cast<WORD>(
+                addressOfNameOrdinals[i] + exportDirectory->Base);  // 设置序号
+
+            export_list.push_back(
+                std::make_shared<moudle_export>(exportData));
+        }
+    }
+    return export_list;
+}
+auto Sandbox::ResolveImportExports() -> void {
+    for (auto module : m_moduleList) {
+        if (module->base == m_peInfo->RecImageBase) {
+            continue;
+        }
+
+        module->export_function = ResolveExport(module->real_base);
+        for (const auto item : module->export_function) {
+            if (LOG_LEVEL > 0) {
+                printf("[ResolveImportExports] import export: [%s] %s => %llx\n", module->name,
+                       item->name, item->function_address);
+            }
+
+            m_exportFuncDict.push_back(item);
+        }
+    }
+}
+auto Sandbox::mapSystemModuleToVmByName(std::string systemName) -> void {
+    for (auto module : m_moduleList) {
+        if (strcmp(module->name, systemName.c_str()) == 0) {
+            if (LOG_LEVEL > 0) {
+                printf("skip module name: %s (already loaded)\n", module->name);
+            }
+            return;
+        }
+    }
+    // 构建模块路径
+    const std::string systemDir =
+        m_peInfo->isX64 ? "\\System32\\" : "\\SysWOW64\\";
+    char windowsPath[MAX_PATH];
+    if (!GetWindowsDirectoryA(windowsPath, sizeof(windowsPath))) {
+        throw std::runtime_error("Failed to get Windows directory");
+    }
+
+    const std::string modulePath =
+        std::string(windowsPath) + systemDir + systemName;
+
+    // 加载PE模块
+    size_t mappedPeSize = 0;
+    const auto moduleBase = reinterpret_cast<uint64_t>(
+        peconv::load_pe_module(modulePath.c_str(), mappedPeSize, false, false));
+
+    if (!moduleBase) {
+        return;
+    }
+
+    // 添加到虚拟机
+    PushModuleToVM(systemName.c_str(), moduleBase);
+}
+auto Sandbox::processImportModule(const moudle_import* importModule) -> void {
+
+    mapSystemModuleToVmByName(importModule->dll_name);
+}
+auto Sandbox::ResoveImport() -> void {
+    // 处理延迟导入
+    peconv::load_delayed_imports(static_cast<BYTE*>(m_peInfo->peBuffer), 0);
+
+    // 解析导入表
+    cListImportNames importCallback(static_cast<BYTE*>(m_peInfo->peBuffer),
+                                    m_peInfo->peSize, m_impFuncDict,
+                                    m_impFuncOrdinalDict);
+
+    if (!peconv::process_import_table(static_cast<BYTE*>(m_peInfo->peBuffer),
+                                      m_peInfo->peSize, &importCallback)) {
+        throw std::runtime_error("Failed to process import table");
+    }
+
+    // 处理每个导入模块
+    for (const auto& importModule : m_impFuncDict) {
+        processImportModule(importModule.get());
+    }
+    for (const auto& importModule : m_impFuncOrdinalDict) {
+        mapSystemModuleToVmByName(importModule->dll_name);
+    }
+}
+auto Sandbox::SetupVirtualMachine() -> void {
+    SegmentSelector cs = {0};
+    cs.fields.index = 1;
+    uc_reg_write(m_ucEngine, UC_X86_REG_CS, &cs.all);
+
+    SegmentSelector ds = {0};
+    ds.fields.index = 2;
+    uc_reg_write(m_ucEngine, UC_X86_REG_DS, &ds.all);
+
+    SegmentSelector ss = {0};
+    ss.fields.index = 2;
+    uc_reg_write(m_ucEngine, UC_X86_REG_SS, &ss.all);
+
+    SegmentSelector es = {0};
+    es.fields.index = 2;
+    uc_reg_write(m_ucEngine, UC_X86_REG_ES, &es.all);
+
+    SegmentSelector gs = {0};
+    gs.fields.index = 2;
+    uc_reg_write(m_ucEngine, UC_X86_REG_GS, &gs.all);
+
+    FlagRegister eflags = {0};
+    eflags.fields.id = 1;
+    eflags.fields.intf = 1;
+    eflags.fields.reserved1 = 1;
+
+    uc_reg_write(m_ucEngine, UC_X86_REG_EFLAGS, &eflags.all);
+
+    uint64_t cr8 = 0;
+    uc_reg_write(m_ucEngine, UC_X86_REG_CR8, &cr8);
+
+    /*
+        映射 m_KSharedUserDataBase
+    */
+    m_KSharedUserDataBase = 0x7FFE0000;
+    uint64_t m_KSharedUserDataEnd = 0x7FFE0FFF;  // 0x7FFE2000
+    m_KSharedUserDataSize = AlignToSectionAlignment(
+        m_KSharedUserDataEnd - m_KSharedUserDataBase, PAGE_SIZE);
+
+    uc_mem_map(m_ucEngine, m_KSharedUserDataBase, m_KSharedUserDataSize,
+               UC_PROT_READ);
+    uc_mem_write(m_ucEngine, m_KSharedUserDataBase,
+                 (void*)m_KSharedUserDataBase, m_KSharedUserDataSize);
+
+    m_tebBase = TEB_BASE;             // 进程TEB地址
+    m_pebBase = PEB_BASE;             // 进程PEB地址
+    m_envBlockBase = ENV_BLOCK_BASE;  // 环境变量块地址
+    // stack
+    m_stackBase = AlignToSectionAlignment(
+        this->m_peInfo->isX64 ? STACK_BASE_64 : STACK_BASE_32, 16);
+    m_stackSize = AlignToSectionAlignment(
+        this->m_peInfo->isX64 ? STACK_SIZE_64 : STACK_SIZE_32, 16);
+    m_stackEnd = m_stackBase + m_stackSize;
+
+    // heap
+    m_heapBase = this->m_peInfo->isX64 ? HEAP_ADDRESS_64 : HEAP_ADDRESS_32;
+    m_heapSize = this->m_peInfo->isX64 ? HEAP_SIZE_64 : HEAP_SIZE_32;
+    m_heapEnd = m_heapBase + m_heapSize;
+
+    // 根据PE文件类型设置PEB和TEB
+    if (this->m_peInfo->isX64) {
+        // 设置64位PEB
+        m_peb64.ImageBaseAddress = m_peInfo->RecImageBase;
+        m_pebEnd =
+            m_pebBase + AlignToSectionAlignment(sizeof(X64PEB), PAGE_SIZE);
+        m_tebEnd =
+            m_tebBase + AlignToSectionAlignment(sizeof(X64TEB), PAGE_SIZE);
+
+        // 设置64位TEB
+        m_teb64.ClientId.UniqueProcess = GetCurrentProcessId();
+        m_teb64.ClientId.UniqueThread = GetCurrentThreadId();
+        m_teb64.ProcessEnvironmentBlock = reinterpret_cast<X64PEB*>(m_pebBase);
+        m_teb64.NtTib.StackBase = (DWORD64)m_stackBase;
+        m_teb64.NtTib.StackLimit = (DWORD64)m_stackSize;
+
+        // 设置堆
+        m_peb64.ProcessHeap = m_heapBase;
+
+        // 设置GS基址结构
+        m_gsBaseStruct.teb = m_tebBase;
+        m_gsBaseStruct.peb = m_pebBase;
+        uint64_t gsAllocSize =
+            AlignToSectionAlignment(sizeof(struct_gs_base), PAGE_SIZE);
+
+        // 映射PEB到虚拟内存
+        uc_mem_map(m_ucEngine, m_pebBase, m_pebEnd - m_pebBase,
+                   UC_PROT_READ | UC_PROT_WRITE);
+        uc_mem_write(m_ucEngine, m_pebBase, &m_peb64, sizeof(X64PEB));
+
+        // 映射TEB到虚拟内存
+        uc_mem_map(m_ucEngine, m_tebBase, m_tebEnd - m_tebBase,
+                   UC_PROT_READ | UC_PROT_WRITE);
+        uc_mem_write(m_ucEngine, m_tebBase, &m_teb64, sizeof(X64TEB));
+
+        // 映射GS基址结构到虚拟内存
+        uc_mem_map(m_ucEngine, m_gsBase, gsAllocSize, UC_PROT_READ);
+        uc_mem_write(m_ucEngine, m_gsBase, &m_gsBaseStruct,
+                     sizeof(struct_gs_base));
+
+        // 设置GS基址MSR
+        uc_x86_msr msr;
+        msr.rid = static_cast<uint32_t>(Msr::kIa32GsBase);
+        msr.value = m_gsBase;
+        uc_reg_write(m_ucEngine, UC_X86_REG_MSR, &msr);
+    } else {
+        // 设置32位PEB
+        m_peb32.ImageBaseAddress = static_cast<ULONG>(m_peInfo->RecImageBase);
+        m_pebEnd =
+            m_pebBase + AlignToSectionAlignment(sizeof(X32PEB), PAGE_SIZE);
+        m_tebEnd =
+            m_tebBase + AlignToSectionAlignment(sizeof(X32TEB), PAGE_SIZE);
+
+        // 设置32位TEB
+        m_teb32.ClientId.UniqueProcess = GetCurrentProcessId();
+        m_teb32.ClientId.UniqueThread = GetCurrentThreadId();
+        m_teb32.ProcessEnvironmentBlock = static_cast<ULONG>(m_pebBase);
+        m_teb32.NtTib.StackBase = static_cast<ULONG>(m_stackBase);
+        m_teb32.NtTib.StackLimit = static_cast<ULONG>(m_stackSize);
+        // 初始化NT_TIB结构的其余部分
+        m_teb32.NtTib.Self =
+            static_cast<ULONG>(m_tebBase);  // 关键：设置Self指针指向TEB本身
+        m_teb32.NtTib.ExceptionList = 0xFFFFFFFF;  // 初始异常链表指向特殊值
+        m_teb32.NtTib.Version = 0;
+        m_teb32.NtTib.FiberData = 0;
+        m_teb32.NtTib.ArbitraryUserPointer = 0;
+
+        // 设置堆
+        m_peb32.ProcessHeap = static_cast<ULONG>(m_heapBase);
+
+        // 映射PEB到虚拟内存
+        uc_mem_map(m_ucEngine, m_pebBase, m_pebEnd - m_pebBase,
+                   UC_PROT_READ | UC_PROT_WRITE);
+        uc_mem_write(m_ucEngine, m_pebBase, &m_peb32, sizeof(X32PEB));
+
+        // 映射TEB到虚拟内存
+        uc_mem_map(m_ucEngine, m_tebBase, m_tebEnd - m_tebBase,
+                   UC_PROT_READ | UC_PROT_WRITE);
+        uc_mem_write(m_ucEngine, m_tebBase, &m_teb32, sizeof(X32TEB));
+
+        // 对于32位，我们需要设置FS段寄存器指向TEB
+        SegmentSelector fs = {0};
+        fs.fields.index = 3;
+        // 不需要设置present和dpl，因为SegmentSelector结构体中没有这些字段
+        uc_reg_write(m_ucEngine, UC_X86_REG_FS, &fs.all);
+
+        // 设置FS基址MSR
+        uc_x86_msr msr;
+        msr.rid = static_cast<uint32_t>(Msr::kIa32FsBase);
+        msr.value = m_tebBase;
+        uc_reg_write(m_ucEngine, UC_X86_REG_MSR, &msr);
+
+        // 确保TEB中关键字段被正确初始化
+        // 特别是FS:18h (0x18)处应该指向自身
+        // 根据Native_Struct.h中X32TEB定义，偏移0x18处是SelfTeb
+        uint32_t self_teb_ptr = static_cast<uint32_t>(m_tebBase);
+        // 在NT_TIB中设置SelfTeb (offset 0x18)
+        uc_mem_write(m_ucEngine, m_tebBase + 0x18, &self_teb_ptr,
+                     sizeof(uint32_t));
+
+        // 确保TEB中的ProcessEnvironmentBlock字段指向PEB
+        uint32_t peb_ptr = static_cast<uint32_t>(m_pebBase);
+        // 偏移0x30处是ProcessEnvironmentBlock
+        uc_mem_write(m_ucEngine, m_tebBase + 0x30, &peb_ptr, sizeof(uint32_t));
+    }
+    // 映射新的内存区域
+    size_t envSize =
+        AlignToSectionAlignment(this->GetEnvStringsSize(), PAGE_SIZE);
+    printf("env block size: %llx\n", envSize);  // 添加调试输出
+    uc_err envErr = uc_mem_map(m_ucEngine, m_envBlockBase, envSize,
+                               UC_PROT_READ | UC_PROT_WRITE);
+    if (envErr != UC_ERR_OK) {
+        throw std::runtime_error("Failed to map environment block");
+    }
+
+    auto envData = this->GetEnvString();
+    envErr = uc_mem_write(m_ucEngine, m_envBlockBase, envData.data(),
+                          envData.size() * sizeof(wchar_t));
+    if (envErr != UC_ERR_OK) {
+        throw std::runtime_error("Failed to write environment block");
+    }
+
+    for (DWORD i = 0; i < 64; i++) {
+        GetTeb64()->TlsSlots[i] = (void*)0x1337ffffff;
+    }
+    for (DWORD i = 0; i < 64; i++) {
+        GetTeb32()->TlsSlots[i] = 0x1337;
+    }
+}
+/*
+// 在InitEnv函数之前添加这个函数
+void Sandbox::RegisterComApis() {
+    // 注册COM相关API
+    _fakeApi coInitializeEx = {Api_CoInitializeEx, 2};  // pvReserved, dwCoInit
+    _fakeApi coCreateInstance = {
+        Api_CoCreateInstance, 5};  // rclsid, pUnkOuter, dwClsContext, riid, ppv
+    _fakeApi variantInit = {Api_VariantInit, 1};        // pvarg
+    _fakeApi variantClear = {Api_VariantClear, 1};      // pvarg
+    _fakeApi sysAllocString = {Api_SysAllocString, 1};  // psz
+
+    // 将API添加到映射表中
+    m_apiMap["CoInitializeEx"] = coInitializeEx;
+    m_apiMap["CoCreateInstance"] = coCreateInstance;
+    m_apiMap["VariantInit"] = variantInit;
+    m_apiMap["VariantClear"] = variantClear;
+    m_apiMap["SysAllocString"] = sysAllocString;
+}
+*/
+// 在InitEnv函数中调用RegisterComApis
+auto Sandbox::InitEnv(std::shared_ptr<BasicPeInfo> peInfo) -> void {
+    m_peInfo = peInfo;
+    if (cs_open(CS_ARCH_X86, peInfo->isX64 ? CS_MODE_64 : CS_MODE_32,
+                &m_csHandle) != CS_ERR_OK) {
+        throw std::runtime_error("Failed to initialize Capstone");
+    }
+    if (uc_open(UC_ARCH_X86, peInfo->isX64 ? UC_MODE_64 : UC_MODE_32,
+                &m_ucEngine) != UC_ERR_OK) {
+        cs_close(&m_csHandle);  // 清理已分配的capstone资源
+        throw std::runtime_error("Failed to initialize Unicorn");
+    }
+    // 一定要确保他是第一个.
+    auto newModule = CreateModuleInfo(
+        "huoji.exe", m_peInfo->RecImageBase, m_peInfo->RecImageBase,
+        reinterpret_cast<uint64_t>(m_peInfo->peBuffer));
+    _ASSERTE(m_moduleList.size() == 0);
+    m_moduleList.push_back(newModule);
+
+    // 将模块添加到LDR链表中
+    if (m_peInfo->isX64) {
+        AddModuleToLdr(newModule);
+    }
+
+    ResoveImport();
+    ResolveImportExports();
+
+    // 修复导入表
+    cFixImprot importFixer(this);
+    if (!peconv::load_imports(m_peInfo->peBuffer, &importFixer)) {
+        throw std::runtime_error("Failed to fix imports");
+    }
+
+    // 给所有导入表加c3
+    for (const auto& module : this->GetModuleList()) {
+        // 遍历导出函数查找对应名称
+        for (const auto& exp : module->export_function) {
+            auto inMemAddr = module->base + exp->function_address;
+            uc_mem_write(m_ucEngine, inMemAddr, "\xCC", sizeof(char));
+        }
+    }
+    uc_err ucErr = uc_mem_map(m_ucEngine, m_peInfo->RecImageBase,
+                              m_peInfo->peSize, UC_PROT_ALL);
+    if (ucErr != UC_ERR_OK) {
+        throw std::runtime_error("Failed to map memory");
+    }
+    uc_mem_write(m_ucEngine, m_peInfo->RecImageBase, m_peInfo->peBuffer,
+                 m_peInfo->peSize);
+    printf("map file to vm file: %llx\n", m_peInfo->RecImageBase);
+    printf("map file to vm size: %llx\n", m_peInfo->peSize);
+    SetupVirtualMachine();
+    InitCommandLine(peInfo->inputFilePath);
+}
+
+auto Sandbox::Run(uint64_t address) -> void {
+    // 初始化堆栈
+    uc_err err = uc_mem_map(m_ucEngine, m_stackBase, m_stackSize,
+                            UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to map stack memory");
+    }
+
+    // 初始化堆
+    err = uc_mem_map(m_ucEngine, m_heapBase, m_heapSize,
+                     UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to map heap memory");
+    }
+
+    // 设置寄存器
+    uint64_t rsp = m_stackEnd - 256;
+    err = uc_reg_write(m_ucEngine,
+                       m_peInfo->isX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP, &rsp);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to write stack pointer");
+    }
+    uint64_t rbp =
+        rsp - (m_peInfo->isX64 ? sizeof(uint64_t) : sizeof(uint32_t));
+    uc_reg_write(m_ucEngine, m_peInfo->isX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP,
+                 &rbp);
+
+    // 设置入口点
+    uint64_t entryPoint = (m_peInfo->RecImageBase + m_peInfo->entryPoint);
+
+    // 添加钩子
+    uc_hook hook_code, hook_mem, hook_mem_unmap, hook_mem_write, hook_syscall;
+
+    // 代码执行钩子
+    err = uc_hook_add(m_ucEngine, &hook_code, UC_HOOK_CODE,
+                      reinterpret_cast<void*>(sandboxCallbacks::handleCodeRun),
+                      this, 1, 0);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add code hook");
+    }
+
+    // 内存读取钩子
+    err =
+        uc_hook_add(m_ucEngine, &hook_mem, UC_HOOK_MEM_READ | UC_HOOK_MEM_FETCH,
+                    reinterpret_cast<void*>(sandboxCallbacks::handleMemoryRead),
+                    this, 1, 0);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add memory read hook");
+    }
+
+    // 未映射内存访问钩子
+    err = uc_hook_add(
+        m_ucEngine, &hook_mem_unmap,
+        UC_HOOK_MEM_FETCH_UNMAPPED | UC_HOOK_MEM_READ_UNMAPPED |
+            UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_PROT,
+        reinterpret_cast<void*>(sandboxCallbacks::handleMemoryUnmapRead), this,
+        1, 0);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add unmapped memory hook");
+    }
+
+    // 内存写入钩子
+    err = uc_hook_add(
+        m_ucEngine, &hook_mem_write, UC_HOOK_MEM_WRITE | UC_HOOK_MEM_WRITE_PROT,
+        reinterpret_cast<void*>(sandboxCallbacks::handleMemoryWrite), this, 1,
+        0);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add memory write hook");
+    }
+
+    // 系统调用钩子
+    err = uc_hook_add(m_ucEngine, &hook_syscall, UC_HOOK_INTR | UC_HOOK_INSN,
+                      reinterpret_cast<void*>(sandboxCallbacks::handleSyscall),
+                      this, 1, 0, UC_X86_INS_SYSCALL);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add syscall hook");
+    }
+    // 系统调用钩子
+    err = uc_hook_add(m_ucEngine, &hook_syscall, UC_HOOK_INTR | UC_HOOK_INSN,
+                      reinterpret_cast<void*>(sandboxCallbacks::handleSyscall),
+                      this, 1, 0, UC_X86_INS_SYSCALL);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to add syscall hook");
+    }
+    auto customIP = address;
+    // 设置EIP/RIP
+    err = uc_reg_write(m_ucEngine,
+                       m_peInfo->isX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP,
+                       &entryPoint);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to set entry point");
+    }
+
+    InitApiHooks();
+
+    std::cout << "Starting execution at " << std::hex << entryPoint
+              << std::endl;
+    uint64_t timeout = 2 * 60 * 1000 * 1000;
+    // 1.入口点是必须跑的
+    if (m_peInfo->isDll) {
+        // 给rcx和rdx设置dll应该设置的
+        auto dll_fdwReason = 1;  // DLL_PROCESS_ATTACH
+        if (m_peInfo->isX64) {
+            uc_reg_write(m_ucEngine, UC_X86_REG_RCX, &m_peInfo->RecImageBase);
+            uc_reg_write(m_ucEngine, UC_X86_REG_RDX, &dll_fdwReason);
+        } else {
+            // 32位使用栈传参而不是寄存器传参
+            uint32_t rsp;
+            uc_reg_read(m_ucEngine, UC_X86_REG_ESP, &rsp);
+
+            // 为参数腾出空间
+            rsp -= 3 * 4;  // 三个参数：hinstDLL, fdwReason, lpvReserved
+            uc_reg_write(m_ucEngine, UC_X86_REG_ESP, &rsp);
+
+            // 按照从右到左的顺序压栈
+            uint32_t lpvReserved = 0;         // 第三个参数为NULL
+            uint32_t reason = dll_fdwReason;  // DLL_PROCESS_ATTACH
+            uint32_t imageBase = static_cast<uint32_t>(m_peInfo->RecImageBase);
+
+            // 按照从右到左的调用约定写入参数到栈上
+            uc_mem_write(m_ucEngine, rsp, &lpvReserved,
+                         sizeof(uint32_t));  // lpvReserved (最右侧参数最先入栈)
+            uc_mem_write(m_ucEngine, rsp + 4, &reason,
+                         sizeof(uint32_t));  // fdwReason (中间参数次之入栈)
+            uc_mem_write(m_ucEngine, rsp + 8, &imageBase,
+                         sizeof(uint32_t));  // hinstDLL (最左侧参数最后入栈)
+
+            // 在Windows下，DLL的返回地址也需要压栈
+            uint32_t returnAddress = 0xABABABAB;  // 虚拟的返回地址
+            rsp -= 4;                             // 为返回地址腾出空间
+            uc_reg_write(m_ucEngine, UC_X86_REG_ESP, &rsp);
+            uc_mem_write(m_ucEngine, rsp, &returnAddress, sizeof(uint32_t));
+        }
+    }
+    err = uc_emu_start(m_ucEngine, entryPoint, m_peInfo->imageEnd, timeout, 0);
+    // 2. 有自定义地址 再跑自定义地址
+    std::cerr << "Entry Point Emulation error: " << uc_strerror(err)
+              << std::endl;
+    if (address != 0) {
+        err = uc_emu_start(m_ucEngine, address, m_peInfo->imageEnd, timeout, 0);
+        std::cerr << "Custom Emulation error: " << uc_strerror(err)
+                  << std::endl;
+    }
+}
+
+auto Sandbox::GetEnvString() -> std::vector<wchar_t> {
+    std::vector<wchar_t> envBlock;
+    // 添加一些基本的环境变量
+    const std::wstring vars[] = {
+        L"ALLUSERSPROFILE=C:\\ProgramData",
+        L"APPDATA=C:\\Users\\User\\AppData\\Roaming",
+        L"CommonProgramFiles=C:\\Program Files\\Common Files",
+        L"COMPUTERNAME=DESKTOP",
+        L"ComSpec=C:\\Windows\\system32\\cmd.exe",
+        L"HOMEDRIVE=C:",
+        L"HOMEPATH=\\Users\\User",
+        L"LOCALAPPDATA=C:\\Users\\User\\AppData\\Local",
+        L"NUMBER_OF_PROCESSORS=8",
+        L"OS=Windows_NT",
+        L"Path=C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem",
+        L"PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+        L"PROCESSOR_ARCHITECTURE=AMD64",
+        L"ProgramData=C:\\ProgramData",
+        L"ProgramFiles=C:\\Program Files",
+        L"PROMPT=$P$G",
+        L"SystemDrive=C:",
+        L"SystemRoot=C:\\Windows",
+        L"TEMP=C:\\Users\\huoji\\AppData\\Local\\Temp",
+        L"TMP=C:\\Users\\huoji\\AppData\\Local\\Temp",
+        L"USERDOMAIN=DESKTOP",
+        L"USERNAME=User",
+        L"USERPROFILE=C:\\Users\\User",
+        L"windir=C:\\Windows"};
+
+    // 将环境变量添加到块中
+    for (const auto& var : vars) {
+        envBlock.insert(envBlock.end(), var.begin(), var.end());
+        envBlock.push_back(L'\0');  // 每个变量以null结尾
+    }
+    envBlock.push_back(L'\0');  // 环境块以额外的null结尾
+
+    return envBlock;
+}
+
+auto Sandbox::GetEnvStringsSize() -> size_t {
+    return GetEnvString().size() * sizeof(wchar_t);
+}
+
+auto Sandbox::getVirtualMemorySize(BYTE* peBuffer) -> size_t {
+    if (!peBuffer) {
+        return 0;
+    }
+
+    // 解析PE头
+    auto* dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(peBuffer);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+    auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<LPBYTE>(peBuffer) + dosHeader->e_lfanew);
+    // 获取区段头
+    auto* sectionHeader = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+        reinterpret_cast<PUCHAR>(ntHeaders) + sizeof(ntHeaders->Signature) +
+        sizeof(ntHeaders->FileHeader) +
+        ntHeaders->FileHeader.SizeOfOptionalHeader);
+
+    DWORD minOffset = UINT_MAX;
+    DWORD totalSize = 0;
+
+    // 遍历所有区段
+    for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+        const auto& section = sectionHeader[i];
+
+        // 查找最小虚拟地址偏移
+        if (section.VirtualAddress < minOffset) {
+            minOffset = section.VirtualAddress;
+        }
+
+        // 累加虚拟大小
+        totalSize += section.Misc.VirtualSize;
+    }
+
+    // 添加最小偏移到总大小
+    totalSize += minOffset;
+
+    return static_cast<size_t>(totalSize);
+}
+
+auto Sandbox::DumpPE() -> std::pair<std::unique_ptr<BYTE[]>, size_t> {
+    // 查找目标模块 - 这里我们使用主模块(通常是被分析的可执行文件)
+    std::shared_ptr<struct_moudle> targetModule = nullptr;
+    for (const auto& module : m_moduleList) {
+        if (strcmp(module->name, "huoji.exe") == 0) {
+            targetModule = module;
+            break;
+        }
+    }
+
+    if (!targetModule) {
+        throw std::runtime_error("No modules found to dump");
+    }
+
+    // 计算虚拟内存大小
+    auto virtualMemorySize = getVirtualMemorySize(m_peInfo->peBuffer);
+
+    // 创建用于存储转储数据的缓冲区
+    auto resultBuffer = std::make_unique<BYTE[]>(virtualMemorySize);
+
+    // 从虚拟机内存中读取PE文件
+    uc_err err = uc_mem_read(m_ucEngine, m_peInfo->RecImageBase,
+                             resultBuffer.get(), virtualMemorySize);
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("Failed to read memory during PE dump: " +
+                                 std::string(uc_strerror(err)));
+    }
+
+    // 确保PE头部的签名有效
+    auto* dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(resultBuffer.get());
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        throw std::runtime_error("Invalid DOS signature in dumped PE");
+    }
+
+    auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(resultBuffer.get() +
+                                                          dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+        throw std::runtime_error("Invalid NT signature in dumped PE");
+    }
+
+    // 获取当前RIP/EIP作为新的入口点
+    uint64_t currentEntryPoint = 0;
+    if (this->GetCrossSectionExecution().size() > 0) {
+        currentEntryPoint = this->GetCrossSectionExecution()
+                                [this->GetCrossSectionExecution().size() - 1] -
+                            m_peInfo->RecImageBase;
+    }
+
+    PIMAGE_SECTION_HEADER sectionHeaders = nullptr;
+    WORD numberOfSections = 0;
+
+    // 处理32位或64位PE文件
+    if (m_peInfo->isX64) {
+        auto* optHeader64 =
+            &reinterpret_cast<PIMAGE_NT_HEADERS64>(ntHeaders)->OptionalHeader;
+        optHeader64->ImageBase = m_peInfo->RecImageBase;
+        if (currentEntryPoint != 0) {
+            // 修改入口点为当前执行位置
+            optHeader64->AddressOfEntryPoint =
+                static_cast<DWORD>(currentEntryPoint);
+        }
+
+        // 修改SizeOfImage
+        optHeader64->SizeOfImage = static_cast<DWORD>(AlignToSectionAlignment(
+            virtualMemorySize, optHeader64->SectionAlignment));
+
+        // 修改DllCharacteristics以移除ASLR标记
+        optHeader64->DllCharacteristics &=
+            ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+
+        // 获取区段头信息
+        sectionHeaders = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+            reinterpret_cast<ULONG_PTR>(ntHeaders) +
+            sizeof(ntHeaders->Signature) + sizeof(ntHeaders->FileHeader) +
+            ntHeaders->FileHeader.SizeOfOptionalHeader);
+        numberOfSections = ntHeaders->FileHeader.NumberOfSections;
+    } else {
+        auto* optHeader32 =
+            &reinterpret_cast<PIMAGE_NT_HEADERS32>(ntHeaders)->OptionalHeader;
+        optHeader32->ImageBase = static_cast<DWORD>(m_peInfo->RecImageBase);
+
+        if (currentEntryPoint != 0) {
+            // 修改入口点为当前执行位置
+            optHeader32->AddressOfEntryPoint =
+                static_cast<DWORD>(currentEntryPoint);
+        }
+
+        // 修改SizeOfImage
+        optHeader32->SizeOfImage = static_cast<DWORD>(AlignToSectionAlignment(
+            virtualMemorySize, optHeader32->SectionAlignment));
+
+        // 修改DllCharacteristics以移除ASLR标记
+        optHeader32->DllCharacteristics &=
+            ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+
+        // 获取区段头信息
+        sectionHeaders = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+            reinterpret_cast<ULONG_PTR>(ntHeaders) +
+            sizeof(ntHeaders->Signature) + sizeof(ntHeaders->FileHeader) +
+            ntHeaders->FileHeader.SizeOfOptionalHeader);
+        numberOfSections = ntHeaders->FileHeader.NumberOfSections;
+    }
+
+    // 更新代码基址和大小
+    UpdateBaseOfCode(sectionHeaders, ntHeaders, numberOfSections,
+                     static_cast<DWORD>(currentEntryPoint));
+
+    // 修复区段
+    FixSections(sectionHeaders, numberOfSections, virtualMemorySize);
+
+    // 创建一个ExportsMapper对象用于导入表修复
+    peconv::ExportsMapper exportsMap;
+
+    // 添加所有已加载模块到导出表映射中
+    for (const auto& module : m_moduleList) {
+        if (module->base == 0 || module->size == 0) {
+            continue;
+        }
+
+        // 创建临时缓冲区以存储模块内容
+        std::unique_ptr<BYTE[]> moduleBuffer =
+            std::make_unique<BYTE[]>(module->size);
+
+        // 从虚拟机内存读取模块内容
+        uc_err readErr = uc_mem_read(m_ucEngine, module->base,
+                                     moduleBuffer.get(), module->size);
+        if (readErr != UC_ERR_OK) {
+            printf(
+                "Warning: Could not read module %s for exports mapping: %s\n",
+                module->name, uc_strerror(readErr));
+            continue;
+        }
+
+        // 添加模块到导出表映射
+        exportsMap.add_to_lookup(module->name,
+                                 reinterpret_cast<HMODULE>(moduleBuffer.get()),
+                                 module->base);
+    }
+    // 这里有一个严重的问题,就懒得处理了:
+    // 壳里面吐出来的代码的导入表和壳的导入表不是同样一个.
+    // 这个修的是壳的 导入表,所以导入表 修 不 全
+    // 有个很简单的办法,需要搜索IAT结构,然后修改脱壳后的IAT的字段到壳的字段里面,然后再执行一次fix_imports
+    // 懒得写了,家庭作业.自己完成
+    bool importsFixed = peconv::fix_imports(
+        resultBuffer.get(), virtualMemorySize, exportsMap, nullptr);
+    if (importsFixed) {
+        printf("PE file imports fixed successfully\n");
+    } else {
+        printf("Warning: Failed to fix PE file imports\n");
+    }
+
+    size_t out_size = 0;
+
+    // 重新计算校验和
+    if (m_peInfo->isX64) {
+        auto* optHeader64 =
+            &reinterpret_cast<PIMAGE_NT_HEADERS64>(ntHeaders)->OptionalHeader;
+        optHeader64->CheckSum =
+            CalculateChecksum(resultBuffer.get(), virtualMemorySize);
+    } else {
+        auto* optHeader32 =
+            &reinterpret_cast<PIMAGE_NT_HEADERS32>(ntHeaders)->OptionalHeader;
+        optHeader32->CheckSum =
+            CalculateChecksum(resultBuffer.get(), virtualMemorySize);
+    }
+
+    printf(
+        "PE file dumped successfully from address: 0x%llx, size: %zu bytes\n",
+        m_peInfo->RecImageBase, virtualMemorySize);
+    printf("Entry point set to: 0x%llx (RVA: 0x%llx)\n",
+           m_peInfo->RecImageBase + currentEntryPoint, currentEntryPoint);
+
+    return {std::move(resultBuffer), virtualMemorySize};
+}
+
+// 修复区段信息
+void Sandbox::FixSections(PIMAGE_SECTION_HEADER sectionHeaders,
+                          WORD numberOfSections, size_t virtualMemorySize) {
+    if (numberOfSections == 0 || sectionHeaders == nullptr) {
+        return;
+    }
+
+    // 修复每个区段的信息
+    for (WORD i = 0; i < numberOfSections - 1; i++) {
+        auto& currentSection = sectionHeaders[i];
+        auto& nextSection = sectionHeaders[i + 1];
+
+        // 修复大小，使之与下一个区段的起始地址对齐
+        currentSection.SizeOfRawData =
+            nextSection.VirtualAddress - currentSection.VirtualAddress;
+        currentSection.PointerToRawData = currentSection.VirtualAddress;
+        currentSection.Misc.VirtualSize = currentSection.SizeOfRawData;
+    }
+
+    // 修复最后一个区段
+    auto& lastSection = sectionHeaders[numberOfSections - 1];
+    lastSection.SizeOfRawData =
+        static_cast<DWORD>(virtualMemorySize) - lastSection.VirtualAddress;
+    lastSection.PointerToRawData = lastSection.VirtualAddress;
+    lastSection.Misc.VirtualSize = lastSection.SizeOfRawData;
+}
+
+// 计算校验和
+DWORD Sandbox::CalculateChecksum(const BYTE* peBuffer, size_t size) {
+    DWORD sum = 0;
+    const DWORD* ptr = reinterpret_cast<const DWORD*>(peBuffer);
+    const DWORD count = static_cast<DWORD>(size / sizeof(DWORD));
+
+    // 获取校验和字段的偏移
+    const auto dosHeader = (PIMAGE_DOS_HEADER)(peBuffer);
+    const auto ntHeaders = (PIMAGE_NT_HEADERS)(peBuffer + dosHeader->e_lfanew);
+    DWORD checksumOffset = dosHeader->e_lfanew +
+                           FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) +
+                           FIELD_OFFSET(IMAGE_OPTIONAL_HEADER, CheckSum);
+
+    // 计算总和，跳过校验和字段本身
+    for (DWORD i = 0; i < count; i++) {
+        // 跳过校验和字段
+        if ((i * sizeof(DWORD)) == checksumOffset ||
+            (i * sizeof(DWORD)) == checksumOffset + sizeof(DWORD) - 1) {
+            continue;
+        }
+        sum += ptr[i];
+        // 处理溢出
+        if (sum < ptr[i]) {
+            sum++;
+        }
+    }
+
+    // 完成计算
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = sum + static_cast<DWORD>(size);
+
+    return sum;
+}
+
+// 按区段对齐大小进行对齐
+DWORD Sandbox::AlignToSectionAlignment(size_t size, DWORD alignment) {
+    return static_cast<DWORD>(((size + alignment - 1) / alignment) * alignment);
+}
+
+// 更新代码基址和代码大小
+void Sandbox::UpdateBaseOfCode(PIMAGE_SECTION_HEADER sectionHeader,
+                               PIMAGE_NT_HEADERS ntHeaders,
+                               WORD numberOfSections, DWORD entryPoint) {
+    if (sectionHeader == nullptr || ntHeaders == nullptr ||
+        numberOfSections == 0) {
+        return;
+    }
+
+    DWORD baseOfCode = 0;
+    DWORD sizeOfCode = 0;
+    bool foundSection = false;
+
+    // 寻找包含入口点的区段
+    for (WORD i = 0; i < numberOfSections; i++) {
+        auto& section = sectionHeader[i];
+        if (entryPoint >= section.VirtualAddress &&
+            entryPoint < (section.VirtualAddress + section.Misc.VirtualSize)) {
+            baseOfCode = section.VirtualAddress;
+            sizeOfCode = section.Misc.VirtualSize;
+            foundSection = true;
+            break;
+        }
+    }
+
+    // 如果没有找到包含入口点的区段，使用第一个可执行区段
+    if (!foundSection) {
+        for (WORD i = 0; i < numberOfSections; i++) {
+            auto& section = sectionHeader[i];
+            if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                baseOfCode = section.VirtualAddress;
+                sizeOfCode = section.Misc.VirtualSize;
+                foundSection = true;
+                break;
+            }
+        }
+    }
+
+    // 更新NT头部信息
+    if (foundSection) {
+        if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            // 64位PE
+            auto* optHeader64 =
+                &reinterpret_cast<PIMAGE_NT_HEADERS64>(ntHeaders)
+                     ->OptionalHeader;
+            optHeader64->BaseOfCode = baseOfCode;
+        } else {
+            // 32位PE
+            auto* optHeader32 =
+                &reinterpret_cast<PIMAGE_NT_HEADERS32>(ntHeaders)
+                     ->OptionalHeader;
+            optHeader32->BaseOfCode = baseOfCode;
+            optHeader32->SizeOfCode = sizeOfCode;
+        }
+    }
+}
+
+auto Sandbox::InitializeLdrData() -> void {
+    if (m_peInfo->isX64 && m_peb64.Ldr == 0) {
+        // 为LDR_DATA分配内存
+        uint64_t ldrDataAddress = m_pebBase + sizeof(X64PEB);
+        m_pebEnd = ldrDataAddress + sizeof(X64_PEB_LDR_DATA);
+        m_peb64.Ldr = ldrDataAddress;
+
+        // 映射LDR数据内存
+        uc_mem_map(m_ucEngine, ldrDataAddress, sizeof(X64_PEB_LDR_DATA),
+                   UC_PROT_ALL);
+
+        // 初始化LDR_DATA结构
+        X64_PEB_LDR_DATA ldrData = {0};
+        ldrData.Length = sizeof(X64_PEB_LDR_DATA);
+        ldrData.Initialized = 1;
+
+        // 初始化链表头 - 使用适当的类型转换
+        LIST_ENTRY inLoadOrderList = {
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InLoadOrderModuleList)),
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InLoadOrderModuleList))};
+        ldrData.InLoadOrderModuleList = inLoadOrderList;
+
+        LIST_ENTRY inMemoryOrderList = {
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InMemoryOrderModuleList)),
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InMemoryOrderModuleList))};
+        ldrData.InMemoryOrderModuleList = inMemoryOrderList;
+
+        LIST_ENTRY inInitOrderList = {
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InInitializationOrderModuleList)),
+            reinterpret_cast<LIST_ENTRY*>(
+                ldrDataAddress +
+                offsetof(X64_PEB_LDR_DATA, InInitializationOrderModuleList))};
+        ldrData.InInitializationOrderModuleList = inInitOrderList;
+
+        uc_mem_write(m_ucEngine, ldrDataAddress, &ldrData,
+                     sizeof(X64_PEB_LDR_DATA));
+
+        // 更新PEB中的Ldr指针
+        uc_mem_write(m_ucEngine, m_pebBase, &m_peb64, sizeof(X64PEB));
+    }
+}
+
+auto Sandbox::CreateLdrEntry(const std::shared_ptr<struct_moudle>& module,
+                             uint64_t entryAddress, uint64_t fullNameAddress,
+                             uint64_t baseNameAddress) -> LDR_DATA_TABLE_ENTRY {
+    LDR_DATA_TABLE_ENTRY entry = {0};
+    entry.DllBase = reinterpret_cast<PVOID>(module->base);
+    entry.EntryPoint = reinterpret_cast<PVOID>(module->base + module->entry);
+    entry.SizeOfImages = static_cast<ULONG>(module->size);
+
+    // 准备模块名称的Unicode字符串
+    wchar_t nameBuffer[MAX_PATH] = {0};
+    std::mbstowcs(nameBuffer, module->name, strlen(module->name));
+
+    // 设置全路径
+    entry.FullDllName.Length =
+        static_cast<USHORT>(wcslen(nameBuffer) * sizeof(wchar_t));
+    entry.FullDllName.MaximumLength = MAX_PATH * sizeof(wchar_t);
+    entry.FullDllName.Buffer = reinterpret_cast<PWSTR>(fullNameAddress);
+
+    // 设置基本名称
+    entry.BaseDllName.Length =
+        static_cast<USHORT>(wcslen(nameBuffer) * sizeof(wchar_t));
+    entry.BaseDllName.MaximumLength = MAX_PATH * sizeof(wchar_t);
+    entry.BaseDllName.Buffer = reinterpret_cast<PWSTR>(baseNameAddress);
+
+    // 写入Unicode字符串
+    uc_mem_write(m_ucEngine, fullNameAddress, nameBuffer,
+                 (wcslen(nameBuffer) + 1) * sizeof(wchar_t));
+    uc_mem_write(m_ucEngine, baseNameAddress, nameBuffer,
+                 (wcslen(nameBuffer) + 1) * sizeof(wchar_t));
+
+    return entry;
+}
+
+auto Sandbox::UpdateLdrLinks(const LDR_DATA_TABLE_ENTRY& entry,
+                             uint64_t entryAddress, X64_PEB_LDR_DATA& ldrData)
+    -> void {
+    // 更新LDR_DATA中的链表头
+    ldrData.InLoadOrderModuleList.Flink = reinterpret_cast<LIST_ENTRY*>(
+        entryAddress + offsetof(LDR_DATA_TABLE_ENTRY, InLoadOrderLinks));
+    ldrData.InMemoryOrderModuleList.Flink = reinterpret_cast<LIST_ENTRY*>(
+        entryAddress + offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks));
+    ldrData.InInitializationOrderModuleList.Flink =
+        reinterpret_cast<LIST_ENTRY*>(
+            entryAddress +
+            offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks));
+
+    // 写回更新后的LDR_DATA
+    uc_mem_write(m_ucEngine, m_peb64.Ldr, &ldrData, sizeof(X64_PEB_LDR_DATA));
+}
+
+auto Sandbox::AddModuleToLdr(const std::shared_ptr<struct_moudle>& module)
+    -> void {
+    if (!m_peInfo->isX64) {
+        return;  // 暂时只处理64位
+    }
+
+    if (m_peb64.Ldr == 0) {
+        InitializeLdrData();
+    }
+
+    // 为模块创建LDR_DATA_TABLE_ENTRY
+    uint64_t entrySize = sizeof(LDR_DATA_TABLE_ENTRY) +
+                         MAX_PATH * 2;  // 额外空间用于Unicode字符串
+    uint64_t entryAddress = m_pebEnd;
+    m_pebEnd += entrySize;
+
+    // 映射内存
+    uc_mem_map(m_ucEngine, entryAddress, entrySize, UC_PROT_ALL);
+
+    // 设置Unicode字符串地址
+    uint64_t fullNameAddress = entryAddress + sizeof(LDR_DATA_TABLE_ENTRY);
+    uint64_t baseNameAddress = fullNameAddress + MAX_PATH;
+
+    // 创建并初始化LDR_DATA_TABLE_ENTRY
+    auto entry =
+        CreateLdrEntry(module, entryAddress, fullNameAddress, baseNameAddress);
+
+    // 从PEB读取当前LDR_DATA结构
+    X64_PEB_LDR_DATA ldrData;
+    uc_mem_read(m_ucEngine, m_peb64.Ldr, &ldrData, sizeof(X64_PEB_LDR_DATA));
+
+    // 设置链表指针
+    entry.InLoadOrderLinks.Flink = reinterpret_cast<LIST_ENTRY*>(
+        reinterpret_cast<uintptr_t>(ldrData.InLoadOrderModuleList.Flink));
+    entry.InLoadOrderLinks.Blink = reinterpret_cast<LIST_ENTRY*>(
+        m_peb64.Ldr + offsetof(X64_PEB_LDR_DATA, InLoadOrderModuleList));
+
+    entry.InMemoryOrderLinks.Flink = reinterpret_cast<LIST_ENTRY*>(
+        reinterpret_cast<uintptr_t>(ldrData.InMemoryOrderModuleList.Flink));
+    entry.InMemoryOrderLinks.Blink = reinterpret_cast<LIST_ENTRY*>(
+        m_peb64.Ldr + offsetof(X64_PEB_LDR_DATA, InMemoryOrderModuleList));
+
+    entry.InInitializationOrderLinks.Flink =
+        reinterpret_cast<LIST_ENTRY*>(reinterpret_cast<uintptr_t>(
+            ldrData.InInitializationOrderModuleList.Flink));
+    entry.InInitializationOrderLinks.Blink = reinterpret_cast<LIST_ENTRY*>(
+        m_peb64.Ldr +
+        offsetof(X64_PEB_LDR_DATA, InInitializationOrderModuleList));
+
+    // 写入LDR_DATA_TABLE_ENTRY结构
+    uc_mem_write(m_ucEngine, entryAddress, &entry,
+                 sizeof(LDR_DATA_TABLE_ENTRY));
+
+    // 更新链表
+    UpdateLdrLinks(entry, entryAddress, ldrData);
+
+    printf("Added module '%s' to LDR data tables at 0x%llx\n", module->name,
+           entryAddress);
+}
+

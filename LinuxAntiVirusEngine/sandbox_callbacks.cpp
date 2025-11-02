@@ -1,0 +1,336 @@
+#include "sandbox_callbacks.h"
+namespace sandboxCallbacks {
+void handleCodeRun(uc_engine* uc, uint64_t address, uint32_t size,
+                   void* userData) {
+    uint64_t currentRip = 0;
+    uint64_t currentRsp = 0;
+    uint64_t currentRax = 0;
+    static uint64_t lastRip = 0;
+    auto* sandbox = static_cast<Sandbox*>(userData);
+    if (!sandbox) return;
+
+    // 读取当前执行的代码
+    auto codeBuffer = std::make_unique<uint8_t[]>(size);
+    if (uc_mem_read(uc, address, codeBuffer.get(), size) != UC_ERR_OK) {
+        return;
+    }
+
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &currentRax);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP,
+                &currentRip);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP,
+                &currentRsp);
+
+    // 检查当前执行地址所在区段
+    int currentSectionIndex = -1;
+    for (size_t i = 0; i < sandbox->GetModuleList()[0]->sections.size(); i++) {
+        auto section = sandbox->GetModuleList()[0]->sections[i];
+        uint64_t sectionStart =
+            sandbox->GetPeInfo()->RecImageBase + section->base;
+        uint64_t sectionEnd = sectionStart + section->size;
+
+        if (address >= sectionStart && address < sectionEnd) {
+            currentSectionIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    // 如果找到区段，并且与上次执行的区段不同，记录跨区段行为
+    if (currentSectionIndex >= 0 &&
+        sandbox->GetLastExecuteSectionIndex() != currentSectionIndex &&
+        sandbox->GetLastExecuteSectionIndex() != 0) {
+        printf(
+            "[!!!]detect cross section excute, from %d to %d,address: 0x%llx\n",
+            sandbox->GetLastExecuteSectionIndex(), currentSectionIndex,
+            address);
+        sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+
+        // 记录跨区段执行地址
+        sandbox->SetCrossSectionExecution(address);
+    }
+
+    // 更新上次执行的区段
+    if (currentSectionIndex >= 0) {
+        sandbox->SetLastExecuteSectionIndex(currentSectionIndex);
+    }
+    auto [lastReadImpAddr, lastImp] = sandbox->GetLastImpRead();
+    if (lastImp != nullptr && currentRip == lastReadImpAddr) {
+        printf(
+            "direct call function [%s]%s at file address: %llx lastRip: "
+            "%llx\n",
+            lastImp->dll_name,
+            lastImp->name, address, lastRip);
+        sandbox->EmulateApi(uc, lastReadImpAddr, currentRip, lastImp->name);
+        sandbox->SetLastImpRead(0, nullptr);
+    } else {
+        for (auto module : sandbox->GetModuleList()) {
+            for (auto item : module->export_function) {
+                const auto vmAddress = module->base + item->function_address;
+                if (vmAddress == currentRip) {
+                    printf("[!!!]detect no correct call, currentRip: 0x%llx\n",
+                           currentRip);
+                    sandbox->SetLastImpRead(0, nullptr);
+
+                    sandbox->EmulateApi(uc, vmAddress, currentRip, item->name);
+                }
+            }
+        }
+    }
+    lastRip = currentRip;
+    if (LOG_LEVEL > 2) {
+        // 使用Capstone反汇编
+        cs_insn* instruction;
+        size_t instructionCount =
+            cs_disasm(sandbox->GetCapstoneHandle(), codeBuffer.get(), size,
+                      address, 0, &instruction);
+        if (instructionCount > 0) {
+            // 打印地址和反汇编结果
+            printf("0x%016" PRIx64 " %-12s %s\n", instruction[0].address,
+                   instruction[0].mnemonic, instruction[0].op_str);
+        }
+        cs_free(instruction, instructionCount);
+
+        // dumpVmenv(uc, userData);
+    }
+}
+
+void handleMemoryRead(uc_engine* uc, uc_mem_type type, uint64_t address,
+                      int size, int64_t value, void* userData) {
+    auto* sandbox = static_cast<Sandbox*>(userData);
+    if (!sandbox) return;
+
+    uint64_t regRax, regRip, regRbp;
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP,
+                &regRbp);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &regRax);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP,
+                &regRip);
+
+    // 检测是否访问LDR结构
+    if (sandbox->GetPeInfo()->isX64) {
+        uint64_t ldrAddress = sandbox->GetPeb64()->Ldr;
+        if (ldrAddress != 0 && address >= ldrAddress &&
+            address < (ldrAddress + sizeof(X64_PEB_LDR_DATA))) {
+            printf(
+                "[WARNING] Suspicious direct LDR access detected at RIP: "
+                "0x%llx, accessing address: 0x%llx\n",
+                regRip, address);
+            sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+        }
+    } else {
+        uint32_t ldrAddress = sandbox->GetPeb32()->Ldr;
+        if (ldrAddress != 0 && address >= ldrAddress &&
+            address < (ldrAddress + sizeof(_PEB_LDR_DATA))) {
+            printf(
+                "[WARNING] Suspicious direct LDR access detected at RIP: 0x%x, "
+                "accessing address: 0x%llx\n",
+                static_cast<uint32_t>(regRip), address);
+            sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+        }
+    }
+
+    uint64_t readAddress = 0;
+    auto readError =
+        uc_mem_read(sandbox->GetUnicornHandle(), address, &readAddress, size);
+    if (LOG_LEVEL > 2) {
+        printf(
+            "[handleMemoryRead] Address: %p Size: %p Rax: %p Rip: %p Error: %d "
+            "ReadData: %p Rbp: %p\n",
+            address, size, regRax, regRip, readError, readAddress, regRbp);
+    }
+    for (auto imp : sandbox->GetImpFuncDict()) {
+        const auto vmAddress =
+            sandbox->GetPeInfo()->RecImageBase + imp->function_address;
+
+        if (vmAddress == address) {
+            printf(
+                "Handle ImpRead Address: [%s] call function %s at file "
+                "address: %llx readAddress: "
+                "%llx\n",
+                imp->name, imp->name, address, readAddress);
+            sandbox->SetLastImpRead(readAddress, imp);
+        }
+    }
+}
+void dumpVmenv(uc_engine* uc, void* userData) {
+    auto* sandbox = static_cast<Sandbox*>(userData);
+
+    uint64_t Rip = 0;
+    uint64_t Rax = 0;
+    uint64_t Rsp = 0;
+    uint64_t Rbp = 0;
+    uint64_t Rcx = 0;
+    uint64_t Rdx = 0;
+    uint64_t Eax = 0;
+    uint64_t Ecx = 0;
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP,
+                &Rip);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &Rax);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP,
+                &Rsp);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP,
+                &Rbp);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX,
+                &Rcx);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX,
+                &Rdx);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_EAX : UC_X86_REG_EAX,
+                &Eax);
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_ECX : UC_X86_REG_ECX,
+                &Ecx);
+    printf(
+        "[dumpVmenv] Rip: %p lastRip: %p Rax: %p Rsp: %p Rbp: %p Rcx: %p Rdx: %p Eax: "
+        "%08x Ecx: %08x\n",
+        Rip, Rax, Rsp, Rbp, Rcx, Rdx, Eax, Ecx);
+
+    // 打印32层栈内存
+    printf("\n[Stack Memory Dump (32 levels)]\n");
+    const int STACK_LEVELS = 32;
+    const int POINTER_SIZE = sandbox->GetPeInfo()->isX64 ? 8 : 4;
+
+    for (int i = 0; i < STACK_LEVELS; i++) {
+        uint64_t currentAddress = Rsp + (i * POINTER_SIZE);
+        uint64_t memValue = 0;
+
+        if (uc_mem_read(uc, currentAddress, &memValue, POINTER_SIZE) ==
+            UC_ERR_OK) {
+            printf("RSP+%02X [%p]: ", i * POINTER_SIZE, currentAddress);
+            // 按4字节分组显示十六进制
+            for (int j = 0; j < POINTER_SIZE; j += 4) {
+                uint32_t chunk;
+                size_t chunkSize = min(4, POINTER_SIZE - j);
+                if (uc_mem_read(uc, currentAddress + j, &chunk, chunkSize) ==
+                    UC_ERR_OK) {
+                    printf("%08X ", chunk);
+                } else {
+                    printf("???????? ");
+                }
+            }
+
+            // 显示ASCII字符
+            printf("| ");
+            for (int j = 0; j < POINTER_SIZE; j++) {
+                uint8_t byte;
+                if (uc_mem_read(uc, currentAddress + j, &byte, 1) ==
+                    UC_ERR_OK) {
+                    printf("%c", (byte >= 32 && byte <= 126) ? byte : '.');
+                } else {
+                    printf("?");
+                }
+            }
+            printf("\n");
+        } else {
+            printf("RSP+%02X [%p]: Unable to read memory\n", i * POINTER_SIZE,
+                   currentAddress);
+        }
+    }
+
+    printf("\n[Frame Pointer Stack (32 levels)]\n");
+    uint64_t currentBp = Rbp;
+    for (int i = 0; i < STACK_LEVELS && currentBp != 0; i++) {
+        uint64_t nextBp = 0;
+        if (uc_mem_read(uc, currentBp, &nextBp, POINTER_SIZE) == UC_ERR_OK) {
+            printf("Frame %02d [%p]: ", i, currentBp);
+            // 按4字节分组显示十六进制
+            for (int j = 0; j < POINTER_SIZE; j += 4) {
+                uint32_t chunk;
+                size_t chunkSize = min(4, POINTER_SIZE - j);
+                if (uc_mem_read(uc, currentBp + j, &chunk, chunkSize) ==
+                    UC_ERR_OK) {
+                    printf("%08X ", chunk);
+                } else {
+                    printf("???????? ");
+                }
+            }
+
+            // 显示ASCII字符
+            printf("| ");
+            for (int j = 0; j < POINTER_SIZE; j++) {
+                uint8_t byte;
+                if (uc_mem_read(uc, currentBp + j, &byte, 1) == UC_ERR_OK) {
+                    printf("%c", (byte >= 32 && byte <= 126) ? byte : '.');
+                } else {
+                    printf("?");
+                }
+            }
+            printf("\n");
+            currentBp = nextBp;
+        } else {
+            printf("Frame %02d [%p]: Unable to read memory\n", i, currentBp);
+            break;
+        }
+    }
+}
+void handleMemoryUnmapRead(uc_engine* uc, uc_mem_type type, uint64_t address,
+                           int size, int64_t value, void* userData) {
+    // 待实现
+    auto* sandbox = static_cast<Sandbox*>(userData);
+
+    printf("[handleMemoryUnmapRead] Address: %p Size: %p Value: %p\n", address,
+           size, value);
+    dumpVmenv(uc, userData);
+}
+
+void handleMemoryWrite(uc_engine* uc, uc_mem_type type, uint64_t address,
+                       int size, int64_t value, void* userData) {
+    auto* sandbox = static_cast<Sandbox*>(userData);
+    if (!sandbox) return;
+
+    uint64_t regRip;
+    uc_reg_read(uc,
+                sandbox->GetPeInfo()->isX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP,
+                &regRip);
+
+    // 检测是否写入LDR结构
+    if (sandbox->GetPeInfo()->isX64) {
+        uint64_t ldrAddress = sandbox->GetPeb64()->Ldr;
+        if (ldrAddress != 0 && address >= ldrAddress &&
+            address < (ldrAddress + sizeof(X64_PEB_LDR_DATA))) {
+            printf(
+                "[WARNING] Suspicious direct LDR modification detected at RIP: "
+                "0x%llx, modifying address: 0x%llx\n",
+                regRip, address);
+            sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+        }
+    } else {
+        uint32_t ldrAddress = sandbox->GetPeb32()->Ldr;
+        if (ldrAddress != 0 && address >= ldrAddress &&
+            address < (ldrAddress + sizeof(_PEB_LDR_DATA))) {
+            printf(
+                "[WARNING] Suspicious direct LDR modification detected at RIP: "
+                "0x%x, modifying address: 0x%llx\n",
+                static_cast<uint32_t>(regRip), address);
+            sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+        }
+    }
+
+    if (LOG_LEVEL > 2) {
+        printf("[handleMemoryWrite] Address: %p Size: %p Value: %p RIP: %p\n",
+               address, size, value, regRip);
+    }
+}
+
+void handleSyscall(uc_engine* uc, void* userData) {
+    // 待实现
+    auto* sandbox = static_cast<Sandbox*>(userData);
+    if (!sandbox) return;
+    sandbox->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+    printf("[handleSyscall] Syscall detected\n");
+}
+}  // namespace sandboxCallbacks

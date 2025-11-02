@@ -1,0 +1,2533 @@
+#include "sandbox.h"
+#include "sandbox_callbacks.h"
+
+void Api_GetLastError(void* sandbox, uc_engine* uc, uint64_t address) {
+    auto context = static_cast<Sandbox*>(sandbox);
+    DWORD last_error = 0;
+
+    // 从TEB中获取LastError
+    if (context->GetPeInfo()->isX64) {
+        last_error = context->GetTeb64()->LastErrorValue;
+    } else {
+        last_error = context->GetTeb32()->LastErrorValue;
+    }
+
+    printf("[*] GetLastError: LastError=0x%x\n", last_error);
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &last_error);
+}
+auto Api_InitializeCriticalSectionAndSpinCount(void* sandbox, uc_engine* uc,
+                                               uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCriticalSection = 0;
+    uint32_t dwSpinCount = 0;
+    BOOL success = TRUE;  // 默认返回成功
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCriticalSection, rdx = dwSpinCount
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCriticalSection);
+        uint64_t temp_spin_count = 0;
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_spin_count);
+        dwSpinCount = static_cast<uint32_t>(temp_spin_count);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_cs = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_cs, sizeof(uint32_t));
+        lpCriticalSection = temp_cs;
+        esp_address += 0x4;
+        uc_mem_read(uc, esp_address, &dwSpinCount, sizeof(uint32_t));
+    }
+
+    if (lpCriticalSection != 0) {
+        // 初始化关键段结构
+        RTL_CRITICAL_SECTION cs = {0};
+        cs.LockCount = -1;           // 初始未锁定状态
+        cs.RecursionCount = 0;       // 初始递归计数为0
+        cs.SpinCount = dwSpinCount;  // 设置自旋计数
+        cs.OwningThread = 0;         // 初始无拥有线程
+        cs.LockSemaphore = 0;        // 初始信号量为0
+
+        // 写入初始化后的结构到目标内存
+        uc_mem_write(uc, lpCriticalSection, &cs, sizeof(RTL_CRITICAL_SECTION));
+    } else {
+        success = FALSE;
+        // 设置LastError
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf(
+        "[*] InitializeCriticalSectionAndSpinCount: CS=0x%llx, SpinCount=0x%x, "
+        "Success=%d\n",
+        lpCriticalSection, dwSpinCount, success);
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+
+auto Api_InitializeCriticalSectionEx(void* sandbox, uc_engine* uc,
+                                     uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCriticalSection = 0;
+    uint32_t dwSpinCount = 0;
+    uint32_t dwFlags = 0;
+    BOOL success = TRUE;  // 默认返回成功
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCriticalSection, rdx = dwSpinCount, r8 = dwFlags
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCriticalSection);
+        uint64_t temp_spin_count = 0;
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_spin_count);
+        dwSpinCount = static_cast<uint32_t>(temp_spin_count);
+        uint64_t temp_flags = 0;
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_flags);
+        dwFlags = static_cast<uint32_t>(temp_flags);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_cs = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_cs, sizeof(uint32_t));
+        lpCriticalSection = temp_cs;
+        esp_address += 0x4;
+        uc_mem_read(uc, esp_address, &dwSpinCount, sizeof(uint32_t));
+        esp_address += 0x4;
+        uc_mem_read(uc, esp_address, &dwFlags, sizeof(uint32_t));
+    }
+
+    if (lpCriticalSection != 0) {
+        // 初始化关键段结构
+        RTL_CRITICAL_SECTION cs = {0};
+        cs.LockCount = -1;           // 初始未锁定状态
+        cs.RecursionCount = 0;       // 初始递归计数为0
+        cs.SpinCount = dwSpinCount;  // 设置自旋计数
+        cs.OwningThread = 0;         // 初始无拥有线程
+        cs.LockSemaphore = 0;        // 初始信号量为0
+
+        // 处理特殊标志
+        // CRITICAL_SECTION_FLAG_NO_DEBUG_INFO = 0x01000000
+        // CRITICAL_SECTION_FLAG_DYNAMIC_SPIN = 0x02000000
+        // CRITICAL_SECTION_FLAG_STATIC_INIT = 0x04000000
+        // CRITICAL_SECTION_FLAG_RESOURCE_TYPE = 0x08000000
+        // CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO = 0x10000000
+
+        // 写入初始化后的结构到目标内存
+        uc_mem_write(uc, lpCriticalSection, &cs, sizeof(RTL_CRITICAL_SECTION));
+    } else {
+        success = FALSE;
+        // 设置LastError
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf(
+        "[*] InitializeCriticalSectionEx: CS=0x%llx, SpinCount=0x%x, "
+        "Flags=0x%x, "
+        "Success=%d\n",
+        lpCriticalSection, dwSpinCount, dwFlags, success);
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+
+auto Api_TlsAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    DWORD tls_index = TLS_OUT_OF_INDEXES;  // 默认返回失败值
+
+    // 获取TEB结构
+    if (context->GetPeInfo()->isX64) {
+        auto teb = context->GetTeb64();
+        // 在TLS槽中查找第一个可用的位置
+        for (DWORD i = 0; i < 64; i++) {  // TEB中TlsSlots数组大小为64
+            if (teb->TlsSlots[i] == (void*)0x1337ffffff) {
+                teb->TlsSlots[i] = (void*)0;  // 标记为已使用
+                tls_index = i;
+                break;
+            }
+        }
+    } else {
+        auto teb = context->GetTeb32();
+        // 在TLS槽中查找第一个可用的位置
+        for (DWORD i = 0; i < 64; i++) {  // TEB中TlsSlots数组大小为64
+            if (teb->TlsSlots[i] == 0x1337) {
+                teb->TlsSlots[i] = 0;  // 标记为已使用
+                tls_index = i;
+                break;
+            }
+        }
+    }
+
+    if (tls_index == TLS_OUT_OF_INDEXES) {
+        // 设置LastError为没有可用的TLS索引
+        DWORD error = ERROR_NO_MORE_ITEMS;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] TlsAlloc: Allocated TLS Index=0x%x\n", tls_index);
+
+    // 返回分配的TLS索引
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &tls_index);
+}
+auto Api_TlsSetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwTlsIndex = 0;
+    uint64_t lpTlsValue = 0;
+    BOOL success = FALSE;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwTlsIndex, rdx = lpTlsValue
+        uint64_t temp_index;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_index);
+        dwTlsIndex = static_cast<uint32_t>(temp_index);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpTlsValue);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &dwTlsIndex, sizeof(uint32_t));
+        esp_address += 0x4;
+        uint32_t temp_value;
+        uc_mem_read(uc, esp_address, &temp_value, sizeof(uint32_t));
+        lpTlsValue = temp_value;
+    }
+
+    // 检查索引是否有效（小于64）
+    if (dwTlsIndex < 64) {
+        if (context->GetPeInfo()->isX64) {
+            auto teb = context->GetTeb64();
+            // 检查槽是否已分配（不为nullptr）
+            if (teb->TlsSlots[dwTlsIndex] != (void*)0x1337ffffff) {
+                teb->TlsSlots[dwTlsIndex] = (void*)lpTlsValue;
+                success = TRUE;
+            }
+        } else {
+            auto teb = context->GetTeb32();
+            // 检查槽是否已分配（不为0）
+            if (teb->TlsSlots[dwTlsIndex] != 0x1337) {
+                teb->TlsSlots[dwTlsIndex] = static_cast<uint32_t>(lpTlsValue);
+                success = TRUE;
+            }
+        }
+    }
+
+    if (!success) {
+        // 设置LastError
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] TlsSetValue: Index=0x%x, Value=0x%llx, Success=%d\n",
+           dwTlsIndex, lpTlsValue, success);
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+auto Api_DeleteCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCriticalSection = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCriticalSection
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCriticalSection);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_cs = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_cs, sizeof(uint32_t));
+        lpCriticalSection = temp_cs;
+    }
+
+    if (lpCriticalSection != 0) {
+        // 读取现有的关键段结构
+        RTL_CRITICAL_SECTION cs;
+        uc_mem_read(uc, lpCriticalSection, &cs, sizeof(RTL_CRITICAL_SECTION));
+
+        // 检查是否有线程仍在等待
+        if (cs.LockCount >= 0) {
+            // 有线程正在等待，设置错误
+            DWORD error = ERROR_SEM_IS_SET;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+        }
+
+        // 清零内存，表示删除
+        memset(&cs, 0, sizeof(RTL_CRITICAL_SECTION));
+        uc_mem_write(uc, lpCriticalSection, &cs, sizeof(RTL_CRITICAL_SECTION));
+    }
+
+    printf("[*] DeleteCriticalSection: CS=0x%llx\n", lpCriticalSection);
+}
+
+auto Api_IsProcessorFeaturePresent(void* sandbox, uc_engine* uc,
+                                   uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t feature_number = 0;
+    BOOL is_supported = FALSE;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = FeatureNumber
+        uint64_t temp_feature;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_feature);
+        feature_number = static_cast<uint32_t>(temp_feature);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &feature_number, sizeof(uint32_t));
+    }
+
+    // 模拟一些常见的处理器特性
+    switch (feature_number) {
+        case PF_FLOATING_POINT_PRECISION_ERRATA:  // 0
+            is_supported = FALSE;
+            break;
+        case PF_FLOATING_POINT_EMULATED:  // 1
+            is_supported = FALSE;
+            break;
+        case PF_COMPARE_EXCHANGE_DOUBLE:  // 2
+            is_supported = TRUE;
+            break;
+        case PF_MMX_INSTRUCTIONS_AVAILABLE:  // 3
+            is_supported = TRUE;
+            break;
+        case PF_XMMI_INSTRUCTIONS_AVAILABLE:  // 6
+            is_supported = TRUE;
+            break;
+        case PF_3DNOW_INSTRUCTIONS_AVAILABLE:  // 7
+            is_supported = FALSE;
+            break;
+        case PF_RDTSC_INSTRUCTION_AVAILABLE:  // 8
+            is_supported = TRUE;
+            break;
+        case PF_PAE_ENABLED:  // 9
+            is_supported = TRUE;
+            break;
+        case PF_XMMI64_INSTRUCTIONS_AVAILABLE:  // 10
+            is_supported = TRUE;
+            break;
+        case PF_SSE_DAZ_MODE_AVAILABLE:  // 11
+            is_supported = TRUE;
+            break;
+        case PF_NX_ENABLED:  // 12
+            is_supported = TRUE;
+            break;
+        case PF_SSE3_INSTRUCTIONS_AVAILABLE:  // 13
+            is_supported = TRUE;
+            break;
+        case PF_COMPARE_EXCHANGE128:  // 14
+            is_supported = TRUE;
+            break;
+        case PF_XSAVE_ENABLED:  // 17
+            is_supported = TRUE;
+            break;
+        case PF_ARM_VFP_32_REGISTERS_AVAILABLE:  // 18
+            is_supported = FALSE;
+            break;
+        default:
+            is_supported = FALSE;
+            break;
+    }
+
+    printf("[*] IsProcessorFeaturePresent: Feature=0x%x, Supported=%d\n",
+           feature_number, is_supported);
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &is_supported);
+}
+
+auto Api___set_app_type(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    int32_t appType = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = appType
+        uint64_t temp_type;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_type);
+        appType = static_cast<int32_t>(temp_type);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &appType, sizeof(int32_t));
+    }
+
+    // 简单地返回0表示成功
+    int32_t result = 0;
+    printf("[*] __set_app_type: AppType=%d\n", appType);
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Api___p__fmode(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto sb = static_cast<Sandbox*>(sandbox);
+
+    // 检查是否已经创建了 _fmode 变量
+    static uint64_t fmode_address = 0;
+    static int32_t fmode_value = 0;  // 默认为文本模式 (_O_TEXT)
+
+    if (fmode_address == 0) {
+        // 为 _fmode 变量分配内存
+        // 使用特定堆地址，与其他 API 一致
+        uint64_t heap_handle =
+            sb->GetPeInfo()->isX64 ? HEAP_ADDRESS_64 : HEAP_ADDRESS_32;
+
+        // 在堆上分配空间
+        HeapSegment* segment = nullptr;
+        auto it = sb->m_heapSegments.find(heap_handle);
+        if (it != sb->m_heapSegments.end()) {
+            segment = it->second;
+        } else {
+            // 创建新的堆段
+            segment = sb->CreateHeapSegment(heap_handle, 0x10000);
+            sb->m_heapSegments[heap_handle] = segment;
+        }
+
+        if (segment) {
+            fmode_address = sb->AllocateFromSegment(segment, sizeof(int32_t));
+            if (fmode_address) {
+                // 初始化 _fmode 为文本模式
+                uc_mem_write(uc, fmode_address, &fmode_value, sizeof(int32_t));
+                printf(
+                    "[*] __p__fmode: Allocated _fmode at 0x%llx with value "
+                    "%d\n",
+                    fmode_address, fmode_value);
+            }
+        }
+    }
+
+    // 返回 _fmode 变量的地址
+    printf("[*] __p__fmode: Returning address 0x%llx\n", fmode_address);
+
+    // 设置返回值
+    if (sb->GetPeInfo()->isX64) {
+        uc_reg_write(uc, UC_X86_REG_RAX, &fmode_address);
+    } else {
+        uint32_t eax = static_cast<uint32_t>(fmode_address);
+        uc_reg_write(uc, UC_X86_REG_EAX, &eax);
+    }
+}
+
+// 实现 AreFileApisANSI API
+auto Api_AreFileApisANSI(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    // 默认返回TRUE，表示使用ANSI字符集
+    BOOL isAnsi = TRUE;
+    printf("[*] AreFileApisANSI: IsAnsi=%d\n", isAnsi);
+
+    // 返回结果
+    uc_reg_write(uc,
+                 static_cast<Sandbox*>(sandbox)->GetPeInfo()->isX64
+                     ? UC_X86_REG_RAX
+                     : UC_X86_REG_EAX,
+                 &isAnsi);
+}
+
+auto Api_WideCharToMultiByte(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t CodePage = 0;
+    uint32_t dwFlags = 0;
+    uint64_t lpWideCharStr = 0;
+    int32_t cchWideChar = 0;
+    uint64_t lpMultiByteStr = 0;
+    int32_t cbMultiByte = 0;
+    uint64_t lpDefaultChar = 0;
+    uint64_t lpUsedDefaultChar = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx, rdx, r8, r9, [rsp+0x28], [rsp+0x30], [rsp+0x38], [rsp+0x40]
+        uint64_t temp_codepage = 0;
+        uint64_t temp_flags = 0;
+        uint64_t temp_widechar = 0;
+        uint64_t temp_cchwidechar = 0;
+
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_codepage);
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_flags);
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_widechar);
+        uc_reg_read(uc, UC_X86_REG_R9, &temp_cchwidechar);
+
+        CodePage = static_cast<uint32_t>(temp_codepage);
+        dwFlags = static_cast<uint32_t>(temp_flags);
+        lpWideCharStr = temp_widechar;
+        cchWideChar = static_cast<int32_t>(temp_cchwidechar);
+
+        // 获取栈上的参数
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uint64_t shadow_space = 0x20;
+
+        uc_mem_read(uc, rsp + shadow_space + 0x8, &lpMultiByteStr,
+                    sizeof(uint64_t));
+        uc_mem_read(uc, rsp + shadow_space + 0x10, &cbMultiByte,
+                    sizeof(int32_t));
+        uc_mem_read(uc, rsp + shadow_space + 0x18, &lpDefaultChar,
+                    sizeof(uint64_t));
+        uc_mem_read(uc, rsp + shadow_space + 0x20, &lpUsedDefaultChar,
+                    sizeof(uint64_t));
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uc_mem_read(uc, esp_address, &CodePage, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &dwFlags, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x8, &lpWideCharStr, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0xC, &cchWideChar, sizeof(int32_t));
+        uc_mem_read(uc, esp_address + 0x10, &lpMultiByteStr, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x14, &cbMultiByte, sizeof(int32_t));
+        uc_mem_read(uc, esp_address + 0x18, &lpDefaultChar, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x1C, &lpUsedDefaultChar,
+                    sizeof(uint32_t));
+    }
+
+    // 基本参数验证
+    if (lpWideCharStr == 0 || cchWideChar == 0) {
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        int result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 读取源宽字符串
+    std::vector<wchar_t> srcBuffer;
+    size_t actualWideLength = 0;
+
+    if (cchWideChar == -1) {
+        // 如果长度为-1,则源字符串以null结尾
+        wchar_t ch = 0;
+        do {
+            if (uc_mem_read(uc, lpWideCharStr + (actualWideLength * 2), &ch,
+                            2) != UC_ERR_OK) {
+                break;
+            }
+            srcBuffer.push_back(ch);
+            actualWideLength++;
+        } while (ch != 0 && actualWideLength < MAX_PATH);
+
+        if (actualWideLength >= MAX_PATH) {
+            DWORD error = ERROR_INSUFFICIENT_BUFFER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            int result = 0;
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+    } else {
+        // 使用指定长度
+        if (cchWideChar > 0 && cchWideChar <= 4 * 1024) {
+            srcBuffer.resize(cchWideChar);
+            if (uc_mem_read(uc, lpWideCharStr, srcBuffer.data(),
+                            cchWideChar * 2) != UC_ERR_OK) {
+                DWORD error = ERROR_INVALID_PARAMETER;
+                if (context->GetPeInfo()->isX64) {
+                    context->GetTeb64()->LastErrorValue = error;
+                } else {
+                    context->GetTeb32()->LastErrorValue = error;
+                }
+                int result = 0;
+                uc_reg_write(uc,
+                             context->GetPeInfo()->isX64 ? UC_X86_REG_RAX
+                                                         : UC_X86_REG_EAX,
+                             &result);
+                return;
+            }
+            actualWideLength = cchWideChar;
+        } else {
+            DWORD error = ERROR_INVALID_PARAMETER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            int result = 0;
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+    }
+
+    // 读取默认字符和使用默认字符标志
+    char defaultChar = '?';
+    BOOL usedDefaultChar = FALSE;
+    if (lpDefaultChar != 0) {
+        uc_mem_read(uc, lpDefaultChar, &defaultChar, 1);
+    }
+
+    // 计算所需的多字节缓冲区大小
+    int requiredSize = WideCharToMultiByte(
+        CodePage, dwFlags, srcBuffer.data(), static_cast<int>(actualWideLength),
+        nullptr, 0, lpDefaultChar ? &defaultChar : nullptr,
+        lpUsedDefaultChar ? &usedDefaultChar : nullptr);
+
+    if (requiredSize == 0) {
+        // 获取并设置错误码
+        DWORD error = GetLastError();
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        int result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 如果只是查询所需缓冲区大小
+    if (lpMultiByteStr == 0 || cbMultiByte == 0) {
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &requiredSize);
+        return;
+    }
+
+    // 检查目标缓冲区大小是否足够
+    if (cbMultiByte < requiredSize) {
+        DWORD error = ERROR_INSUFFICIENT_BUFFER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        int result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 执行实际转换
+    std::vector<char> multiByteBuffer(requiredSize);
+    int result = WideCharToMultiByte(
+        CodePage, dwFlags, srcBuffer.data(), static_cast<int>(actualWideLength),
+        multiByteBuffer.data(), requiredSize,
+        lpDefaultChar ? &defaultChar : nullptr,
+        lpUsedDefaultChar ? &usedDefaultChar : nullptr);
+
+    if (result > 0) {
+        // 写入转换后的字符串到目标内存
+        if (uc_mem_write(uc, lpMultiByteStr, multiByteBuffer.data(), result) !=
+            UC_ERR_OK) {
+            DWORD error = ERROR_INVALID_PARAMETER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            result = 0;
+        }
+
+        // 如果需要，写回使用默认字符标志
+        if (lpUsedDefaultChar != 0) {
+            uc_mem_write(uc, lpUsedDefaultChar, &usedDefaultChar, sizeof(BOOL));
+        }
+    } else {
+        // 获取并设置错误码
+        DWORD error = GetLastError();
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf(
+        "[*] WideCharToMultiByte: CodePage=%u, Flags=0x%x, WideStr=%p, "
+        "WideLen=%d, MultiStr=%p, MultiLen=%d, Result=%d\n",
+        CodePage, dwFlags, (void*)lpWideCharStr, cchWideChar,
+        (void*)lpMultiByteStr, cbMultiByte, result);
+    printf("[*] WideCharToMultiByte: pre=%s\n", multiByteBuffer.data());
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+// 实现 InitializeSListHead API
+auto Api_InitializeSListHead(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t ListHead = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = ListHead
+        uc_reg_read(uc, UC_X86_REG_RCX, &ListHead);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_listhead = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_listhead, sizeof(uint32_t));
+        ListHead = temp_listhead;
+    }
+
+    if (ListHead != 0) {
+        if (context->GetPeInfo()->isX64) {
+            // 64位系统的SLIST_HEADER结构 (16字节对齐)
+            struct SLIST_HEADER64 {
+                union {
+                    struct {
+                        ULONGLONG Alignment;
+                        ULONGLONG Region;
+                    } DUMMYSTRUCTNAME;
+                    struct {
+                        ULONGLONG Depth : 16;
+                        ULONGLONG Sequence : 48;
+                        ULONGLONG Reserved : 4;
+                        ULONGLONG NextEntry : 60;
+                    } HeaderX64;
+                };
+            } header = {0};
+
+            // 初始化Depth和Sequence为0
+            header.HeaderX64.Depth = 0;
+            header.HeaderX64.Sequence = 0;
+            header.HeaderX64.Reserved = 0;
+            header.HeaderX64.NextEntry = 0;
+
+            // 写入初始化的结构
+            uc_mem_write(uc, ListHead, &header, sizeof(SLIST_HEADER64));
+        } else {
+            // 32位系统的SLIST_HEADER结构 (8字节)
+            struct SLIST_HEADER32 {
+                union {
+                    ULONGLONG Alignment;
+                    struct {
+                        SLIST_ENTRY* Next;
+                        WORD Depth;
+                        WORD Sequence;
+                    } Header32;
+                };
+            } header = {0};
+
+            // 初始化Next、Depth和Sequence为0
+            header.Header32.Next = nullptr;
+            header.Header32.Depth = 0;
+            header.Header32.Sequence = 0;
+
+            // 写入初始化的结构
+            uc_mem_write(uc, ListHead, &header, sizeof(SLIST_HEADER32));
+        }
+    }
+
+    printf("[*] InitializeSListHead: ListHead=0x%llx\n", ListHead);
+}
+
+// 实现 GetEnvironmentStringsW API
+auto Api_GetEnvironmentStringsW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t envBlock = context->GetEnvBlockBase();
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &envBlock);
+}
+
+// 实现 FreeEnvironmentStringsW API
+auto Api_FreeEnvironmentStringsW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpszEnvironmentBlock = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpszEnvironmentBlock
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpszEnvironmentBlock);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_block = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_block, sizeof(uint32_t));
+        lpszEnvironmentBlock = temp_block;
+    }
+
+    // 检查传入的地址是否是我们之前分配的环境块地址
+    BOOL success = (lpszEnvironmentBlock == context->GetEnvBlockBase());
+
+    if (!success) {
+        // 如果地址无效，设置错误码
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] FreeEnvironmentStringsW: Block=0x%llx, Success=%d\n",
+           lpszEnvironmentBlock, success);
+
+    // 返回操作是否成功
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+
+// 实现HeapCreate API
+auto Api_HeapCreate(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t flOptions = 0;
+    uint64_t dwInitialSize = 0;
+    uint64_t dwMaximumSize = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = flOptions, rdx = dwInitialSize, r8 = dwMaximumSize
+        uint64_t temp_options;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_options);
+        flOptions = static_cast<uint32_t>(temp_options);
+        uc_reg_read(uc, UC_X86_REG_RDX, &dwInitialSize);
+        uc_reg_read(uc, UC_X86_REG_R8, &dwMaximumSize);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &flOptions, sizeof(uint32_t));
+        esp_address += 0x4;
+        uint32_t temp_initial;
+        uc_mem_read(uc, esp_address, &temp_initial, sizeof(uint32_t));
+        dwInitialSize = temp_initial;
+        esp_address += 0x4;
+        uint32_t temp_maximum;
+        uc_mem_read(uc, esp_address, &temp_maximum, sizeof(uint32_t));
+        dwMaximumSize = temp_maximum;
+    }
+
+    // 如果初始大小为0，使用默认大小
+    if (dwInitialSize == 0) {
+        dwInitialSize =
+            context->GetPeInfo()->isX64 ? HEAP_SIZE_64 : HEAP_SIZE_32;
+    }
+
+    // 如果最大大小小于初始大小，将其设置为初始大小
+    if (dwMaximumSize < dwInitialSize) {
+        dwMaximumSize = dwInitialSize;
+    }
+
+    // 生成新的堆基址
+    uint64_t heapBase =
+        context->GetPeInfo()->isX64
+            ? (HEAP_ADDRESS_64 +
+               (context->GetHeapBlocks().size() * HEAP_SIZE_64))
+            : (HEAP_ADDRESS_32 +
+               (context->GetHeapBlocks().size() * HEAP_SIZE_32));
+
+    // 创建新的堆段
+    HeapSegment* segment = context->CreateHeapSegment(heapBase, dwInitialSize);
+    if (segment == nullptr) {
+        uint64_t null_handle = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &null_handle);
+        return;
+    }
+
+    // 将新堆段添加到堆映射表中
+    context->m_heapSegments[heapBase] = segment;
+
+    // 映射堆内存
+    uc_err err =
+        uc_mem_map(uc, heapBase, dwInitialSize, UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK) {
+        uint64_t null_handle = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &null_handle);
+        return;
+    }
+
+    printf(
+        "[*] HeapCreate: Options=0x%x, InitialSize=0x%llx, MaximumSize=0x%llx, "
+        "Handle=0x%llx\n",
+        flOptions, dwInitialSize, dwMaximumSize, heapBase);
+
+    // 返回堆句柄（使用堆基址作为句柄）
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &heapBase);
+}
+
+// 实现 SHGetKnownFolderPath API
+auto Api_SHGetKnownFolderPath(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t rfid = 0;      // REFKNOWNFOLDERID
+    uint64_t dwFlags = 0;   // DWORD
+    uint64_t hToken = 0;    // HANDLE
+    uint64_t ppszPath = 0;  // PWSTR*
+    uint64_t result = 0;    // 返回值
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = rfid, rdx = dwFlags, r8 = hToken, r9 = ppszPath
+        uc_reg_read(uc, UC_X86_REG_RCX, &rfid);
+        uc_reg_read(uc, UC_X86_REG_RDX, &dwFlags);
+        uc_reg_read(uc, UC_X86_REG_R8, &hToken);
+        uc_reg_read(uc, UC_X86_REG_R9, &ppszPath);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_rfid = 0;
+        uint32_t temp_flags = 0;
+        uint32_t temp_token = 0;
+        uint32_t temp_path = 0;
+
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uc_mem_read(uc, esp_address, &temp_rfid, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &temp_flags, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &temp_token, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &temp_path, sizeof(uint32_t));
+
+        rfid = temp_rfid;
+        dwFlags = temp_flags;
+        hToken = temp_token;
+        ppszPath = temp_path;
+    }
+
+    // 根据已知文件夹ID分配不同的路径
+    std::wstring folderPath;
+
+    // 常见已知文件夹GUID的16进制值映射表
+    std::map<uint64_t, std::wstring> knownFolders = {
+        // FOLDERID_Desktop = {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        {0xB4BFCC3A, L"C:\\Users\\User\\Desktop"},
+        // FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+        {0xFDD39AD0, L"C:\\Users\\User\\Documents"},
+        // FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        {0x374DE290, L"C:\\Users\\User\\Downloads"},
+        // FOLDERID_ProgramFiles = {905e63b6-c1bf-494e-b29c-65b732d3d21a}
+        {0x905e63b6, L"C:\\Program Files"},
+        // FOLDERID_ProgramFilesX86 = {7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}
+        {0x7C5A40EF, L"C:\\Program Files (x86)"},
+        // FOLDERID_Windows = {F38BF404-1D43-42F2-9305-67DE0B28FC23}
+        {0xF38BF404, L"C:\\Windows"},
+        // FOLDERID_System = {1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}
+        {0x1AC14E77, L"C:\\Windows\\System32"},
+        // FOLDERID_SystemX86 = {D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}
+        {0xD65231B0, L"C:\\Windows\\SysWOW64"},
+        // FOLDERID_ProgramData = {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
+        {0x62AB5D82, L"C:\\ProgramData"},
+        // FOLDERID_LocalAppData = {F1B32785-6FBA-4FCF-9D55-7B8E7F157091}
+        {0xF1B32785, L"C:\\Users\\User\\AppData\\Local"},
+        // FOLDERID_RoamingAppData = {3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}
+        {0x3EB685DB, L"C:\\Users\\User\\AppData\\Roaming"},
+        // FOLDERID_Startup = {B97D20BB-F46A-4C97-BA10-5E3608430854}
+        {0xB97D20BB,
+         L"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Start "
+         L"Menu\\Programs\\Startup"},
+        // FOLDERID_StartMenu = {625B53C3-AB48-4EC1-BA1F-A1EF4146FC19}
+        {0x625B53C3,
+         L"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"},
+        // FOLDERID_Fonts = {FD228CB7-AE11-4AE3-864C-16F3910AB8FE}
+        {0xFD228CB7, L"C:\\Windows\\Fonts"},
+        // FOLDERID_Templates = {A63293E8-664E-48DB-A079-DF759E0509F7}
+        {0xA63293E8,
+         L"C:\\Users\\User\\AppData\\Roaming\\Microsoft\\Windows\\Templates"},
+        // FOLDERID_PublicDesktop = {C4AA340D-F20F-4863-AFEF-F87EF2E6BA25}
+        {0xC4AA340D, L"C:\\Users\\Public\\Desktop"},
+        // FOLDERID_CommonDocuments = {ED4824AF-DCE4-45A8-81E2-FC7965083634}
+        {0xED4824AF, L"C:\\Users\\Public\\Documents"}};
+
+    // 从传入的rfid获取第一个DWORD作为键
+    uint32_t guidFirstDword = 0;
+    uc_mem_read(uc, rfid, &guidFirstDword, sizeof(uint32_t));
+
+    // 查找对应的文件夹路径
+    auto it = knownFolders.find(guidFirstDword);
+    if (it != knownFolders.end()) {
+        context->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+        folderPath = it->second;
+    } else {
+        // 如果找不到对应的GUID，返回默认文档文件夹
+        folderPath = L"C:\\Users\\User\\Documents";
+    }
+
+    // 分配内存用于存储路径
+    uint64_t pathBuffer = 0;
+    size_t bufferSize = (folderPath.length() + 1) * sizeof(wchar_t);
+
+    // 从堆中分配内存
+    if (context->GetPeInfo()->isX64) {
+        HeapSegment* segment = context->FindHeapSegment(HEAP_ADDRESS_64);
+        if (segment) {
+            pathBuffer = context->AllocateFromSegment(segment, bufferSize);
+        }
+    } else {
+        HeapSegment* segment = context->FindHeapSegment(HEAP_ADDRESS_32);
+        if (segment) {
+            pathBuffer = context->AllocateFromSegment(segment, bufferSize);
+        }
+    }
+
+    if (pathBuffer != 0) {
+        // 写入路径
+        uc_mem_write(uc, pathBuffer, folderPath.c_str(), bufferSize);
+
+        // 写入路径地址到ppszPath指向的位置
+        if (ppszPath != 0) {
+            uc_mem_write(uc, ppszPath, &pathBuffer,
+                         context->GetPeInfo()->isX64 ? 8 : 4);
+            result = 0;  // S_OK
+        } else {
+            result = 0x80070057;  // E_INVALIDARG
+        }
+    } else {
+        result = 0x8007000E;  // E_OUTOFMEMORY
+    }
+
+    printf(
+        "[*] SHGetKnownFolderPath: rfid=0x%llx, flags=0x%x, token=0x%llx, "
+        "path=0x%llx, result=0x%llx, folder=%ls\n",
+        rfid, dwFlags, hToken, ppszPath, result, folderPath.c_str());
+
+    // 设置返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Api_EncodePointer(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t ptr = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = ptr
+        uc_reg_read(uc, UC_X86_REG_RCX, &ptr);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_ptr = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_ptr, sizeof(uint32_t));
+        ptr = temp_ptr;
+    }
+
+    // 使用固定密钥进行简单的异或操作来"编码"指针
+    // 注意：这是一个简化的实现，实际的Windows实现更复杂
+    uint64_t cookie = 0x1234567890ABCDEF;
+    uint64_t encoded_ptr = ptr ^ cookie;
+
+    printf("[*] EncodePointer: Original=0x%llx, Encoded=0x%llx\n", ptr,
+           encoded_ptr);
+
+    // 返回编码后的指针
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &encoded_ptr);
+}
+
+auto Api_GetProcessHeap(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    // 返回默认堆句柄（使用堆基址作为句柄）
+    uint64_t heap_handle =
+        context->GetPeInfo()->isX64 ? HEAP_ADDRESS_64 : HEAP_ADDRESS_32;
+
+    printf("[*] GetProcessHeap: Handle=0x%llx\n", heap_handle);
+
+    // 返回堆句柄
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &heap_handle);
+}
+
+// 实现HeapAlloc API
+auto Api_HeapAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t hHeap = 0;
+    uint32_t dwFlags = 0;
+    uint64_t dwBytes = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = hHeap, rdx = dwFlags, r8 = dwBytes
+        uc_reg_read(uc, UC_X86_REG_RCX, &hHeap);
+        uint64_t temp_flags;
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_flags);
+        dwFlags = static_cast<uint32_t>(temp_flags);
+        uc_reg_read(uc, UC_X86_REG_R8, &dwBytes);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_heap;
+        uc_mem_read(uc, esp_address, &temp_heap, sizeof(uint32_t));
+        hHeap = temp_heap;
+        esp_address += 0x4;
+        uc_mem_read(uc, esp_address, &dwFlags, sizeof(uint32_t));
+        esp_address += 0x4;
+        uint32_t temp_bytes;
+        uc_mem_read(uc, esp_address, &temp_bytes, sizeof(uint32_t));
+        dwBytes = temp_bytes;
+    }
+    // 这里如果想检查有效,得先跑main,再跑其他的,浪费时间了,操
+
+    // 检查堆句柄是否有效
+
+    uint64_t expected_handle =
+        context->GetPeInfo()->isX64 ? HEAP_ADDRESS_64 : HEAP_ADDRESS_32;
+    if (hHeap != expected_handle) {
+        uint64_t null_ptr = 0;
+        hHeap = expected_handle;
+        // uc_reg_write(
+        //     uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX :
+        //     UC_X86_REG_EAX, &null_ptr);
+        // return;
+    }
+
+    // 获取或创建堆段
+    HeapSegment* segment = nullptr;
+    auto it = context->m_heapSegments.find(hHeap);
+    if (it == context->m_heapSegments.end()) {
+        segment = context->CreateHeapSegment(
+            hHeap, context->GetPeInfo()->isX64 ? HEAP_SIZE_64 : HEAP_SIZE_32);
+        context->m_heapSegments[hHeap] = segment;
+    } else {
+        segment = it->second;
+    }
+
+    // 分配内存
+    uint64_t allocated_address = context->AllocateFromSegment(segment, dwBytes);
+
+    printf(
+        "[*] HeapAlloc: Handle=0x%llx, Flags=0x%x, Size=0x%llx, "
+        "Address=0x%llx\n",
+        hHeap, dwFlags, dwBytes, allocated_address);
+
+    // 返回分配的地址
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &allocated_address);
+}
+
+// 实现HeapFree API
+auto Api_HeapFree(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t hHeap = 0;
+    uint32_t dwFlags = 0;
+    uint64_t lpMem = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = hHeap, rdx = dwFlags, r8 = lpMem
+        uc_reg_read(uc, UC_X86_REG_RCX, &hHeap);
+        uint64_t temp_flags;
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_flags);
+        dwFlags = static_cast<uint32_t>(temp_flags);
+        uc_reg_read(uc, UC_X86_REG_R8, &lpMem);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_heap;
+        uc_mem_read(uc, esp_address, &temp_heap, sizeof(uint32_t));
+        hHeap = temp_heap;
+        esp_address += 0x4;
+        uc_mem_read(uc, esp_address, &dwFlags, sizeof(uint32_t));
+        esp_address += 0x4;
+        uint32_t temp_mem;
+        uc_mem_read(uc, esp_address, &temp_mem, sizeof(uint32_t));
+        lpMem = temp_mem;
+    }
+
+    // 释放内存
+    bool success = context->FreeBlock(lpMem);
+
+    printf(
+        "[*] HeapFree: Handle=0x%llx, Flags=0x%x, Address=0x%llx, Success=%d\n",
+        hHeap, dwFlags, lpMem, success);
+
+    // 返回操作是否成功
+    uint64_t result = success ? 1 : 0;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+// 实现TlsGetValue API
+auto Api_TlsGetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwTlsIndex = 0;
+    uint64_t return_value = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwTlsIndex
+        uint64_t temp_index;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_index);
+        dwTlsIndex = static_cast<uint32_t>(temp_index);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &dwTlsIndex, sizeof(uint32_t));
+    }
+
+    // 检查索引是否有效（小于64）
+    if (dwTlsIndex < 64) {
+        if (context->GetPeInfo()->isX64) {
+            auto teb = context->GetTeb64();
+            // 检查槽是否已分配（不为nullptr）
+            if (teb->TlsSlots[dwTlsIndex] != (void*)0x1337ffffff) {
+                return_value =
+                    reinterpret_cast<uint64_t>(teb->TlsSlots[dwTlsIndex]);
+            } else {
+                // 槽未分配，设置LastError
+                DWORD error = ERROR_INVALID_PARAMETER;
+                teb->LastErrorValue = error;
+            }
+        } else {
+            auto teb = context->GetTeb32();
+            // 检查槽是否已分配（不为0）
+            if (teb->TlsSlots[dwTlsIndex] != 0x1337) {
+                return_value = teb->TlsSlots[dwTlsIndex];
+            } else {
+                // 槽未分配，设置LastError
+                DWORD error = ERROR_INVALID_PARAMETER;
+                teb->LastErrorValue = error;
+            }
+        }
+    } else {
+        // 索引无效，设置LastError
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] TlsGetValue: Index=0x%x, Value=0x%llx\n", dwTlsIndex,
+           return_value);
+
+    // 返回TLS槽中的值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+auto Api_SetLastError(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwErrCode = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwErrCode
+        uint64_t temp_error;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_error);
+        dwErrCode = static_cast<uint32_t>(temp_error);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &dwErrCode, sizeof(uint32_t));
+    }
+
+    // 设置LastError值
+    if (context->GetPeInfo()->isX64) {
+        context->GetTeb64()->LastErrorValue = dwErrCode;
+    } else {
+        context->GetTeb32()->LastErrorValue = dwErrCode;
+    }
+
+    printf("[*] SetLastError: Error=0x%x\n", dwErrCode);
+}
+
+auto Api_EnterCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCriticalSection = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCriticalSection
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCriticalSection);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_cs = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_cs, sizeof(uint32_t));
+        lpCriticalSection = temp_cs;
+    }
+
+    // 获取当前线程ID
+    HANDLE currentThreadHandle = nullptr;
+    if (context->GetPeInfo()->isX64) {
+        currentThreadHandle =
+            (HANDLE)(ULONG_PTR)context->GetTeb64()->ClientId.UniqueThread;
+    } else {
+        currentThreadHandle =
+            (HANDLE)(ULONG_PTR)context->GetTeb32()->ClientId.UniqueThread;
+    }
+
+    if (lpCriticalSection != 0) {
+        if (context->GetPeInfo()->isX64) {
+            RTL_CRITICAL_SECTION cs;
+            uc_mem_read(uc, lpCriticalSection, &cs,
+                        sizeof(RTL_CRITICAL_SECTION));
+
+            // 如果当前线程已经拥有锁，增加递归计数
+            if (cs.OwningThread == currentThreadHandle) {
+                cs.RecursionCount++;
+            } else {
+                // 如果没有线程拥有锁，获取它
+                if (cs.LockCount == -1) {
+                    cs.OwningThread = currentThreadHandle;
+                    cs.RecursionCount = 1;
+                    cs.LockCount = 0;
+                } else {
+                    // 在实际情况下这里应该自旋等待，但在模拟环境中我们直接获取锁
+                    cs.OwningThread = currentThreadHandle;
+                    cs.RecursionCount = 1;
+                    cs.LockCount++;
+                }
+            }
+
+            // 写回更新后的关键段结构
+            uc_mem_write(uc, lpCriticalSection, &cs,
+                         sizeof(RTL_CRITICAL_SECTION));
+        } else {
+            RTL_CRITICAL_SECTION32 cs;
+            uc_mem_read(uc, lpCriticalSection, &cs,
+                        sizeof(RTL_CRITICAL_SECTION32));
+
+            // 如果当前线程已经拥有锁，增加递归计数
+            if (cs.OwningThread == (DWORD)currentThreadHandle) {
+                cs.RecursionCount++;
+            } else {
+                // 如果没有线程拥有锁，获取它
+                if (cs.LockCount == -1) {
+                    cs.OwningThread = (DWORD)currentThreadHandle;
+                    cs.RecursionCount = 1;
+                    cs.LockCount = 0;
+                } else {
+                    // 在实际情况下这里应该自旋等待，但在模拟环境中我们直接获取锁
+                    cs.OwningThread = (DWORD)currentThreadHandle;
+                    cs.RecursionCount = 1;
+                    cs.LockCount++;
+                }
+            }
+
+            // 写回更新后的关键段结构
+            uc_mem_write(uc, lpCriticalSection, &cs,
+                         sizeof(RTL_CRITICAL_SECTION32));
+        }
+    }
+
+    printf("[*] EnterCriticalSection: CS=0x%llx\n", lpCriticalSection);
+}
+
+auto Api_LeaveCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCriticalSection = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCriticalSection
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCriticalSection);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_cs = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_cs, sizeof(uint32_t));
+        lpCriticalSection = temp_cs;
+    }
+
+    if (lpCriticalSection != 0) {
+        RTL_CRITICAL_SECTION cs;
+        uc_mem_read(uc, lpCriticalSection, &cs, sizeof(RTL_CRITICAL_SECTION));
+
+        // 获取当前线程ID
+        HANDLE currentThreadHandle = nullptr;
+        if (context->GetPeInfo()->isX64) {
+            currentThreadHandle =
+                (HANDLE)(ULONG_PTR)context->GetTeb64()->ClientId.UniqueThread;
+        } else {
+            currentThreadHandle =
+                (HANDLE)(ULONG_PTR)context->GetTeb32()->ClientId.UniqueThread;
+        }
+
+        // 检查当前线程是否拥有锁
+        if (cs.OwningThread == currentThreadHandle) {
+            cs.RecursionCount--;
+            if (cs.RecursionCount == 0) {
+                // 完全释放锁
+                cs.OwningThread = nullptr;
+                cs.LockCount = -1;
+            }
+
+            // 写回更新后的关键段结构
+            uc_mem_write(uc, lpCriticalSection, &cs,
+                         sizeof(RTL_CRITICAL_SECTION));
+        }
+    }
+
+    printf("[*] LeaveCriticalSection: CS=0x%llx\n", lpCriticalSection);
+}
+
+auto Api_GetStartupInfoW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpStartupInfo = 0;
+    printf("[*] GetStartupInfoW start dump vmenv\n");
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpStartupInfo
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpStartupInfo);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_info = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_info, sizeof(uint32_t));
+        lpStartupInfo = temp_info;
+    }
+
+    if (lpStartupInfo != 0) {
+        if (context->GetPeInfo()->isX64) {
+            STARTUPINFOW si = {0};
+            si.cb = sizeof(STARTUPINFOW);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_SHOWNORMAL;
+            si.lpDesktop = nullptr;
+            si.lpTitle = nullptr;
+            si.dwX = 0;
+            si.dwY = 0;
+            si.dwXSize = 0;
+            si.dwYSize = 0;
+            si.dwXCountChars = 0;
+            si.dwYCountChars = 0;
+            si.dwFillAttribute = 0;
+            si.cbReserved2 = 0;
+            si.lpReserved2 = nullptr;
+            si.hStdInput = nullptr;
+            si.hStdOutput = nullptr;
+            si.hStdError = nullptr;
+            uc_mem_write(uc, lpStartupInfo, &si, sizeof(STARTUPINFOW));
+        } else {
+            STARTUPINFOW32 si = {0};
+            si.cb = sizeof(STARTUPINFOW32);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_SHOWNORMAL;
+            si.lpDesktop = 0;
+            si.lpTitle = 0;
+            si.dwX = 0;
+            si.dwY = 0;
+            si.dwXSize = 0;
+            si.dwYSize = 0;
+            si.dwXCountChars = 0;
+            si.dwYCountChars = 0;
+            si.dwFillAttribute = 0;
+            si.cbReserved2 = 0;
+            si.lpReserved2 = 0;
+            si.hStdInput = 0;
+            si.hStdOutput = 0;
+            si.hStdError = 0;
+            uc_mem_write(uc, lpStartupInfo, &si, sizeof(STARTUPINFOW32));
+        }
+    }
+
+    printf("[*] GetStartupInfoW: lpStartupInfo=0x%llx\n", lpStartupInfo);
+}
+
+// 实现 GetStdHandle API
+auto Api_GetStdHandle(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    int32_t nStdHandle = 0;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = nStdHandle
+        uint64_t temp_handle;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_handle);
+        nStdHandle = static_cast<int32_t>(temp_handle);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &nStdHandle, sizeof(int32_t));
+    }
+
+    // 根据请求的标准句柄类型返回相应的句柄
+    switch ((unsigned long)nStdHandle) {
+        case STD_INPUT_HANDLE:                          // -10
+            handle = reinterpret_cast<HANDLE>(0x1000);  // 模拟标准输入句柄
+            break;
+        case STD_OUTPUT_HANDLE:                         // -11
+            handle = reinterpret_cast<HANDLE>(0x2000);  // 模拟标准输出句柄
+            break;                                      // End of Selection
+            break;
+        case STD_ERROR_HANDLE:                          // -12
+            handle = reinterpret_cast<HANDLE>(0x3000);  // 模拟标准错误句柄
+            break;
+        default:
+            handle = INVALID_HANDLE_VALUE;
+            // 设置错误码
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = ERROR_INVALID_PARAMETER;
+            } else {
+                context->GetTeb32()->LastErrorValue = ERROR_INVALID_PARAMETER;
+            }
+            break;
+    }
+
+    printf("[*] GetStdHandle: Type=%d, Handle=0x%p\n", nStdHandle, handle);
+
+    // 返回句柄值
+    uint64_t return_value = reinterpret_cast<uint64_t>(handle);
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+// 实现 GetFileType API
+auto Api_GetFileType(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    HANDLE hFile = nullptr;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = hFile
+        uint64_t temp_handle;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_handle);
+        hFile = reinterpret_cast<HANDLE>(temp_handle);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_handle = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_handle, sizeof(uint32_t));
+        hFile = reinterpret_cast<HANDLE>(static_cast<uint64_t>(temp_handle));
+    }
+
+    DWORD file_type = FILE_TYPE_UNKNOWN;
+
+    // 根据标准句柄类型返回相应的文件类型
+    if (hFile == reinterpret_cast<HANDLE>(0x1000) ||  // STD_INPUT_HANDLE
+        hFile == reinterpret_cast<HANDLE>(0x2000) ||  // STD_OUTPUT_HANDLE
+        hFile == reinterpret_cast<HANDLE>(0x3000)) {  // STD_ERROR_HANDLE
+        file_type = FILE_TYPE_CHAR;  // 控制台句柄通常是字符设备
+    } else {
+        // 对于无效句柄，设置错误码
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = ERROR_INVALID_HANDLE;
+        } else {
+            context->GetTeb32()->LastErrorValue = ERROR_INVALID_HANDLE;
+        }
+        file_type = FILE_TYPE_UNKNOWN;
+    }
+
+    printf("[*] GetFileType: Handle=0x%p, Type=0x%x\n", hFile, file_type);
+
+    // 返回文件类型
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &file_type);
+}
+
+// 实现 GetCommandLineA API
+auto Api_GetCommandLineA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    printf("[*] GetCommandLineA: CommandLine=%s\n", context->GetCommandLine());
+
+    // 返回命令行字符串的地址
+    uint64_t return_value = context->GetCommandLineAddress();
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+// 实现 GetCommandLineW API
+auto Api_GetCommandLineW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    printf("[*] GetCommandLineW: CommandLine=%s\n", context->GetCommandLine());
+
+    // 返回宽字符命令行字符串的地址
+    uint64_t return_value = context->GetCommandLineWAddress();
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+// 实现 GetACP API
+auto Api_GetACP(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    // 返回默认的 ANSI 代码页 (936 - 简体中文)
+    uint32_t codepage = 936;
+    printf("[*] GetACP: CodePage=%u\n", codepage);
+
+    // 返回代码页值
+    uc_reg_write(uc,
+                 static_cast<Sandbox*>(sandbox)->GetPeInfo()->isX64
+                     ? UC_X86_REG_RAX
+                     : UC_X86_REG_EAX,
+                 &codepage);
+}
+
+// 实现 GetCPInfo API
+auto Api_GetCPInfo(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t codePage = 0;
+    uint64_t lpCPInfo = 0;
+    BOOL success = FALSE;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = CodePage, rdx = lpCPInfo
+        uint64_t temp_codepage;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_codepage);
+        codePage = static_cast<uint32_t>(temp_codepage);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpCPInfo);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &codePage, sizeof(uint32_t));
+        esp_address += 0x4;
+        uint32_t temp_cpinfo;
+        uc_mem_read(uc, esp_address, &temp_cpinfo, sizeof(uint32_t));
+        lpCPInfo = temp_cpinfo;
+    }
+
+    if (lpCPInfo != 0) {
+        // 创建 CPINFO 结构
+        CPINFO cpInfo = {0};
+
+        // 根据代码页设置相应的信息
+        switch (codePage) {
+            case 936:                         // 简体中文 GBK
+                cpInfo.MaxCharSize = 2;       // 最大字符大小为2字节
+                cpInfo.DefaultChar[0] = '?';  // 默认替换字符
+                cpInfo.DefaultChar[1] = '\0';
+                cpInfo.LeadByte[0] = 0x81;  // 前导字节范围
+                cpInfo.LeadByte[1] = 0xFE;
+                cpInfo.LeadByte[2] = 0;  // 结束标记
+                success = TRUE;
+                break;
+
+            case 437:                    // US ASCII
+            case 1252:                   // Western European
+                cpInfo.MaxCharSize = 1;  // 单字节字符集
+                cpInfo.DefaultChar[0] = '?';
+                cpInfo.DefaultChar[1] = '\0';
+                cpInfo.LeadByte[0] = 0;  // 无前导字节
+                success = TRUE;
+                break;
+
+            default:
+                // 不支持的代码页
+                if (context->GetPeInfo()->isX64) {
+                    context->GetTeb64()->LastErrorValue =
+                        ERROR_INVALID_PARAMETER;
+                } else {
+                    context->GetTeb32()->LastErrorValue =
+                        ERROR_INVALID_PARAMETER;
+                }
+                success = FALSE;
+                break;
+        }
+
+        if (success) {
+            // 写入 CPINFO 结构到目标内存
+            uc_mem_write(uc, lpCPInfo, &cpInfo, sizeof(CPINFO));
+        }
+    } else {
+        // 无效的指针参数
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = ERROR_INVALID_PARAMETER;
+        } else {
+            context->GetTeb32()->LastErrorValue = ERROR_INVALID_PARAMETER;
+        }
+        success = FALSE;
+    }
+
+    printf("[*] GetCPInfo: CodePage=%u, lpCPInfo=0x%llx, Success=%d\n",
+           codePage, lpCPInfo, success);
+
+    // 返回操作是否成功
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+
+auto Api_MultiByteToWideChar(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t CodePage = 0;
+    uint32_t dwFlags = 0;
+    uint64_t lpMultiByteStr = 0;
+    int32_t cbMultiByte = 0;
+    uint64_t lpWideCharStr = 0;
+    int32_t cchWideChar = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        uint64_t temp_codepage = 0;
+        uint64_t temp_flags = 0;
+        uint64_t temp_multibyte = 0;
+        uint64_t temp_cbmultibyte = 0;
+
+        // x64: rcx, rdx, r8, r9, [rsp+0x28], [rsp+0x30]
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_codepage);
+        uc_reg_read(uc, UC_X86_REG_RDX, &temp_flags);
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_multibyte);
+        uc_reg_read(uc, UC_X86_REG_R9, &temp_cbmultibyte);
+
+        CodePage = static_cast<uint32_t>(temp_codepage);
+        dwFlags = static_cast<uint32_t>(temp_flags);
+        lpMultiByteStr = temp_multibyte;
+        cbMultiByte = static_cast<int32_t>(temp_cbmultibyte);
+
+        // 获取栈上的参数
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+
+        // 读取栈上的参数
+        uint64_t shadow_space = 0x20;  // x64调用约定中的shadow space
+        uc_mem_read(uc, rsp + shadow_space + 0x8, &lpWideCharStr,
+                    sizeof(uint64_t));
+        uc_mem_read(uc, rsp + shadow_space + 0x10, &cchWideChar,
+                    sizeof(int32_t));
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uc_mem_read(uc, esp_address, &CodePage, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &dwFlags, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x8, &lpMultiByteStr, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0xC, &cbMultiByte, sizeof(int32_t));
+        uc_mem_read(uc, esp_address + 0x10, &lpWideCharStr, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x14, &cchWideChar, sizeof(int32_t));
+    }
+
+    // 验证参数
+    if (lpMultiByteStr == 0 || (lpWideCharStr == 0 && cchWideChar != 0)) {
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        int result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 读取源字符串
+    std::vector<char> srcBuffer;
+    if (cbMultiByte == -1) {
+        // 如果长度为-1,则源字符串以null结尾
+        char ch = 0;
+        size_t len = 0;
+        do {
+            if (uc_mem_read(uc, lpMultiByteStr + len, &ch, 1) != UC_ERR_OK) {
+                break;
+            }
+            srcBuffer.push_back(ch);
+            len++;
+        } while (ch != 0 && len < 2 * 1024);  // 添加长度限制防止无限循环
+
+        if (len >= 2 * 1024) {
+            // 设置错误码
+            DWORD error = ERROR_INSUFFICIENT_BUFFER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            int result = 0;
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+
+        cbMultiByte = static_cast<int32_t>(len);
+    } else if (cbMultiByte > 0) {
+        // 使用指定长度，但添加安全检查
+        if (cbMultiByte > MAX_PATH) {
+            DWORD error = ERROR_INSUFFICIENT_BUFFER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            int result = 0;
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+
+        srcBuffer.resize(cbMultiByte);
+        if (uc_mem_read(uc, lpMultiByteStr, srcBuffer.data(), cbMultiByte) !=
+            UC_ERR_OK) {
+            DWORD error = ERROR_INVALID_PARAMETER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            int result = 0;
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+    } else {
+        // 无效的输入长度
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        int result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 计算所需的宽字符缓冲区大小
+    int result = MultiByteToWideChar(CodePage, dwFlags, srcBuffer.data(),
+                                     cbMultiByte, nullptr, 0);
+
+    if (result == 0) {
+        // 转换失败，获取错误码
+        DWORD error = GetLastError();
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 如果只是查询所需缓冲区大小
+    if (lpWideCharStr == 0 || cchWideChar == 0) {
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 检查目标缓冲区大小是否足够
+    if (cchWideChar < result) {
+        DWORD error = ERROR_INSUFFICIENT_BUFFER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    // 执行实际转换
+    std::vector<wchar_t> wideBuffer(result);
+    if (MultiByteToWideChar(CodePage, dwFlags, srcBuffer.data(), cbMultiByte,
+                            wideBuffer.data(), result) > 0) {
+        // 写入转换后的字符串到目标内存
+        if (uc_mem_write(uc, lpWideCharStr, wideBuffer.data(),
+                         result * sizeof(wchar_t)) != UC_ERR_OK) {
+            DWORD error = ERROR_INVALID_PARAMETER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            result = 0;
+        }
+    } else {
+        // 转换失败
+        DWORD error = GetLastError();
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        result = 0;
+    }
+
+    printf(
+        "[*] MultiByteToWideChar: CodePage=%u, Flags=0x%x, Input=%p, "
+        "InputLen=%d, Output=%p, OutputLen=%d, Result=%d\n",
+        CodePage, dwFlags, (void*)lpMultiByteStr, cbMultiByte,
+        (void*)lpWideCharStr, cchWideChar, result);
+    printf("MultiByteToWideChar pre cover string: %s\n", srcBuffer.data());
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Sandbox::CreateHeapSegment(uint64_t base, size_t size) -> HeapSegment* {
+    auto segment = new HeapSegment();
+    segment->base = base;
+    segment->size = size;
+
+    // 创建初始空闲块
+    auto block = new HeapBlock();
+    block->address = base;
+    block->size = size;
+    block->is_free = true;
+    block->next = nullptr;
+    block->prev = nullptr;
+
+    segment->blocks = block;
+    return segment;
+}
+
+auto Sandbox::AllocateFromSegment(HeapSegment* segment, size_t size)
+    -> uint64_t {
+    // 对齐大小到16字节
+    size = (size + 15) & ~15;
+
+    // 查找合适的空闲块
+    HeapBlock* current = segment->blocks;
+    while (current != nullptr) {
+        if (current->is_free && current->size >= size) {
+            // 如果块太大，分割它
+            if (current->size > size + 32) {  // 32字节为最小块大小
+                SplitBlock(current, size);
+            }
+
+            current->is_free = false;
+            return current->address;
+        }
+        current = current->next;
+    }
+
+    return 0;  // 分配失败
+}
+
+auto Api_CloseHandle(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t handle = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = handle
+        uc_reg_read(uc, UC_X86_REG_RCX, &handle);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+        esp += 0x4;  // 跳过返回地址
+        uint32_t temp_handle;
+        uc_mem_read(uc, esp, &temp_handle, sizeof(uint32_t));
+        handle = temp_handle;
+    }
+
+    bool success = true;
+
+    // 如果是进程快照句柄 (0x1337)，清理进程枚举状态
+    if (handle == 0x1337) {
+        auto it = context->process_enum_state.find(handle);
+        if (it != context->process_enum_state.end()) {
+            context->process_enum_state.erase(it);
+        }
+    }
+    // 其他类型的句柄也返回成功
+    // 实际应用中可能需要根据句柄类型进行不同的处理
+
+    printf("[*] CloseHandle: Handle=0x%llx, Success=%d\n", handle, success);
+
+    // 设置返回值
+    uint64_t result = success ? 1 : 0;
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_write(uc, UC_X86_REG_RAX, &result);
+    } else {
+        uint32_t result32 = static_cast<uint32_t>(result);
+        uc_reg_write(uc, UC_X86_REG_EAX, &result32);
+    }
+
+    // 设置错误码
+    DWORD error = success ? 0 : ERROR_INVALID_HANDLE;
+    if (context->GetPeInfo()->isX64) {
+        context->GetTeb64()->LastErrorValue = error;
+    } else {
+        context->GetTeb32()->LastErrorValue = error;
+    }
+}
+
+// 添加RtlFormatCurrentUserKeyPath API实现
+auto Api_RtlFormatCurrentUserKeyPath(void* sandbox, uc_engine* uc,
+                                     uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t keyPathBuffer = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = KeyPathBuffer (PUNICODE_STRING)
+        uc_reg_read(uc, UC_X86_REG_RCX, &keyPathBuffer);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_buffer;
+        uc_mem_read(uc, esp_address, &temp_buffer, sizeof(uint32_t));
+        keyPathBuffer = temp_buffer;
+    }
+
+    // 构造当前用户的注册表路径
+    // 同时在这里实现查询MCP服务器的功能
+    wchar_t userKeyPath[256] =
+        L"\\Registry\\User\\S-1-5-21-1234567890-1234567890-1234567890-1001";
+
+    // 分配内存用于存储路径字符串
+    size_t pathLen = wcslen(userKeyPath);
+    size_t bufferSize = (pathLen + 1) * sizeof(wchar_t);
+    uint64_t stringBuffer = 0;
+
+    // 从堆中分配内存
+    if (context->GetPeInfo()->isX64) {
+        HeapSegment* segment = context->FindHeapSegment(HEAP_ADDRESS_64);
+        if (segment) {
+            stringBuffer = context->AllocateFromSegment(segment, bufferSize);
+        }
+    } else {
+        HeapSegment* segment = context->FindHeapSegment(HEAP_ADDRESS_32);
+        if (segment) {
+            stringBuffer = context->AllocateFromSegment(segment, bufferSize);
+        }
+    }
+
+    if (stringBuffer != 0 && keyPathBuffer != 0) {
+        // 将路径字符串写入到分配的缓冲区
+        uc_mem_write(uc, stringBuffer, userKeyPath, bufferSize);
+        if (context->GetPeInfo()->isX64) {
+            // 创建UNICODE_STRING结构
+            UNICODE_STRING unicodeString;
+            unicodeString.Length =
+                static_cast<USHORT>(pathLen * sizeof(wchar_t));
+            unicodeString.MaximumLength = static_cast<USHORT>(bufferSize);
+            unicodeString.Buffer = reinterpret_cast<PWSTR>(stringBuffer);
+
+            // 将UNICODE_STRING结构写入到提供的缓冲区
+            uc_mem_write(uc, keyPathBuffer, &unicodeString,
+                         sizeof(UNICODE_STRING));
+        } else {
+            UNICODE_STRING32 unicodeString;
+            unicodeString.Length =
+                static_cast<USHORT>(pathLen * sizeof(wchar_t));
+            unicodeString.MaximumLength = static_cast<USHORT>(bufferSize);
+            unicodeString.Buffer = (DWORD)(stringBuffer);
+
+            // 将UNICODE_STRING结构写入到提供的缓冲区
+            uc_mem_write(uc, keyPathBuffer, &unicodeString,
+                         sizeof(UNICODE_STRING32));
+        }
+    }
+
+    // 返回NTSTATUS成功代码 (0x00000000 = STATUS_SUCCESS)
+    uint64_t status = 0;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &status);
+
+    printf(
+        "[*] RtlFormatCurrentUserKeyPath: Buffer=0x%llx, StringBuffer=0x%llx, "
+        "Path=%ls\n",
+        keyPathBuffer, stringBuffer, userKeyPath);
+}
+
+// 添加FlsSetValue API实现
+auto Api_FlsSetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t dwFlsIndex = 0;
+    uint64_t lpFlsData = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwFlsIndex, rdx = lpFlsData
+        uc_reg_read(uc, UC_X86_REG_RCX, &dwFlsIndex);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpFlsData);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_index;
+        uint32_t temp_data;
+        uc_mem_read(uc, esp_address, &temp_index, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &temp_data, sizeof(uint32_t));
+        dwFlsIndex = temp_index;
+        lpFlsData = temp_data;
+    }
+
+    // 模拟FLS存储操作，类似于TLS存储
+    bool success = false;
+    if (dwFlsIndex < 64) {  // 使用与TLS相同的槽位大小
+        // 存储数据到模拟的FLS槽中（复用TLS槽）
+        if (context->GetPeInfo()->isX64) {
+            auto teb = context->GetTeb64();
+            if (teb->TlsSlots[dwFlsIndex] != (void*)0x1337ffffff) {
+                teb->TlsSlots[dwFlsIndex] = (void*)lpFlsData;
+                success = true;
+            }
+        } else {
+            auto teb = context->GetTeb32();
+            if (teb->TlsSlots[dwFlsIndex] != 0x1337) {
+                teb->TlsSlots[dwFlsIndex] = static_cast<uint32_t>(lpFlsData);
+                success = true;
+            }
+        }
+    }
+
+    printf("[*] FlsSetValue: Index=%llu, Data=0x%llx, Success=%d\n", dwFlsIndex,
+           lpFlsData, success);
+
+    // 设置返回值
+    uint64_t result = success ? 1 : 0;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+
+    // 如果失败，设置错误码
+    if (!success) {
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+}
+
+// 实现TlsFree API
+auto Api_TlsFree(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwTlsIndex = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwTlsIndex
+        uint64_t temp_index;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_index);
+        dwTlsIndex = static_cast<uint32_t>(temp_index);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &dwTlsIndex, sizeof(uint32_t));
+    }
+
+    // 检查索引是否有效（小于64）并释放对应的TLS槽
+    BOOL success = FALSE;
+    if (dwTlsIndex < 64) {
+        if (context->GetPeInfo()->isX64) {
+            auto teb = context->GetTeb64();
+            // 检查槽是否已分配（不为0x1337ffffff）
+            if (teb->TlsSlots[dwTlsIndex] != (void*)0x1337ffffff) {
+                // 将槽位标记为可用
+                teb->TlsSlots[dwTlsIndex] = (void*)0x1337ffffff;
+                success = TRUE;
+            }
+        } else {
+            auto teb = context->GetTeb32();
+            // 检查槽是否已分配（不为0x1337）
+            if (teb->TlsSlots[dwTlsIndex] != 0x1337) {
+                // 将槽位标记为可用
+                teb->TlsSlots[dwTlsIndex] = 0x1337;
+                success = TRUE;
+            }
+        }
+    }
+
+    if (!success) {
+        // 设置错误码
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] TlsFree: Index=0x%x, Success=%d\n", dwTlsIndex, success);
+
+    // 返回操作是否成功
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &success);
+}
+
+// 实现FlsAlloc API
+auto Api_FlsAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpCallback = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpCallback
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpCallback);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_callback = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_callback, sizeof(uint32_t));
+        lpCallback = temp_callback;
+    }
+
+    // 初始化返回值为失败状态
+    DWORD fls_index = FLS_OUT_OF_INDEXES;
+
+    // 获取TEB结构
+    if (context->GetPeInfo()->isX64) {
+        auto teb = context->GetTeb64();
+        // 在TLS槽中查找第一个可用的位置
+        for (DWORD i = 0; i < 64; i++) {  // TEB中TlsSlots数组大小为64
+            if (teb->TlsSlots[i] == (void*)0x1337ffffff) {
+                teb->TlsSlots[i] = (void*)0;  // 标记为已使用
+                fls_index = i;
+                break;
+            }
+        }
+    } else {
+        auto teb = context->GetTeb32();
+        // 在TLS槽中查找第一个可用的位置
+        for (DWORD i = 0; i < 64; i++) {  // TEB中TlsSlots数组大小为64
+            if (teb->TlsSlots[i] == 0x1337) {
+                teb->TlsSlots[i] = 0;  // 标记为已使用
+                fls_index = i;
+                break;
+            }
+        }
+    }
+
+    if (fls_index == FLS_OUT_OF_INDEXES) {
+        // 设置LastError为没有可用的FLS索引
+        DWORD error = ERROR_NO_MORE_ITEMS;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] FlsAlloc: Callback=0x%llx, Allocated FLS Index=0x%x\n",
+           lpCallback, fls_index);
+
+    // 返回分配的FLS索引
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &fls_index);
+}
+
+// 实现FlsGetValue API
+auto Api_FlsGetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwFlsIndex = 0;
+    uint64_t return_value = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwFlsIndex
+        uint64_t temp_index;
+        uc_reg_read(uc, UC_X86_REG_RCX, &temp_index);
+        dwFlsIndex = static_cast<uint32_t>(temp_index);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &dwFlsIndex, sizeof(uint32_t));
+    }
+
+    // 检查索引是否有效（小于64）
+    if (dwFlsIndex < 64) {
+        if (context->GetPeInfo()->isX64) {
+            auto teb = context->GetTeb64();
+            // 检查槽是否已分配（不为nullptr）
+            if (teb->TlsSlots[dwFlsIndex] != (void*)0x1337ffffff) {
+                return_value =
+                    reinterpret_cast<uint64_t>(teb->TlsSlots[dwFlsIndex]);
+            } else {
+                // 槽未分配，设置LastError
+                DWORD error = ERROR_INVALID_PARAMETER;
+                teb->LastErrorValue = error;
+            }
+        } else {
+            auto teb = context->GetTeb32();
+            // 检查槽是否已分配（不为0）
+            if (teb->TlsSlots[dwFlsIndex] != 0x1337) {
+                return_value = teb->TlsSlots[dwFlsIndex];
+            } else {
+                // 槽未分配，设置LastError
+                DWORD error = ERROR_INVALID_PARAMETER;
+                teb->LastErrorValue = error;
+            }
+        }
+    } else {
+        // 索引无效，设置LastError
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+
+    printf("[*] FlsGetValue: Index=0x%x, Value=0x%llx\n", dwFlsIndex,
+           return_value);
+
+    // 返回FLS槽中的值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+auto Api__initterm_e(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t table_start = 0;
+    uint64_t table_end = 0;
+
+    // 获取参数：函数表的起始地址和结束地址
+    if (context->GetPeInfo()->isX64) {
+        // x64: 参数在RCX和RDX中
+        uc_reg_read(uc, UC_X86_REG_RCX, &table_start);
+        uc_reg_read(uc, UC_X86_REG_RDX, &table_end);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+        esp += 0x4;  // 跳过返回地址
+
+        uint32_t temp_start;
+        uc_mem_read(uc, esp, &temp_start, sizeof(uint32_t));
+        table_start = temp_start;
+
+        esp += 0x4;
+        uint32_t temp_end;
+        uc_mem_read(uc, esp, &temp_end, sizeof(uint32_t));
+        table_end = temp_end;
+    }
+
+    // 返回值，默认为0（成功）
+    int32_t return_value = 0;
+
+    // 遍历函数表并调用每个初始化函数
+    // 在表的每一项都是函数指针
+    printf("[*] _initterm_e: Start=0x%llx, End=0x%llx\n", table_start,
+           table_end);
+
+    // 只有当表的起始地址和结束地址有效时才进行处理
+    if (table_start < table_end) {
+        uint64_t current = table_start;
+        uint64_t ptr_size = context->GetPeInfo()->isX64 ? 8 : 4;
+
+        // 遍历函数表
+        while (current < table_end) {
+            uint64_t function_ptr = 0;
+
+            // 读取当前表项中的函数指针
+            uc_mem_read(uc, current, &function_ptr, ptr_size);
+
+            // 非空函数指针才调用
+            if (function_ptr != 0) {
+                printf("[*] _initterm_e: Calling function at 0x%llx\n",
+                       function_ptr);
+
+                // 在实际环境中，这里会调用该函数并检查返回值
+                // 但在沙箱中，我们模拟这个调用并返回成功
+                // 如果需要执行真实函数，可以使用uc_emu_start
+
+                // 如果有错误发生，设置返回值并退出
+                // 这里简化处理，始终假设初始化成功
+                // 实际实现可能需要更复杂的逻辑
+            }
+
+            // 移动到下一个表项
+            current += ptr_size;
+        }
+    }
+
+    // 设置返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}
+
+// 实现getenv API
+auto Api_getenv(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t name_ptr = 0;
+    char name[256] = {0};
+    uint64_t return_value = 0;  // 默认返回NULL
+
+    // 获取参数 - 环境变量名称
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = name
+        uc_reg_read(uc, UC_X86_REG_RCX, &name_ptr);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_name_ptr = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_name_ptr, sizeof(uint32_t));
+        name_ptr = temp_name_ptr;
+    }
+
+    // 读取环境变量名
+    if (name_ptr != 0) {
+        size_t i = 0;
+        uint8_t byte = 1;
+        while (byte != 0 && i < sizeof(name) - 1) {
+            uc_mem_read(uc, name_ptr + i, &byte, 1);
+            name[i++] = static_cast<char>(byte);
+        }
+        name[i] = '\0';
+    }
+
+    printf("[*] getenv: Looking for env var '%s'\n", name);
+
+    // 获取环境变量值
+    bool found = false;
+    std::string value;
+    std::vector<std::wstring> envStrings = context->GetEnvStrings();
+
+    for (const auto& var : envStrings) {
+        std::string varA(var.begin(), var.end());
+        size_t pos = varA.find('=');
+        if (pos != std::string::npos) {
+            std::string varName = varA.substr(0, pos);
+            if (_stricmp(varName.c_str(), name) == 0) {
+                value = varA.substr(pos + 1);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        // 分配内存存储环境变量值
+        uint64_t valueSize = value.size() + 1;  // 包括结束符
+        uint64_t valuePtr = context->AllocateMemory(valueSize);
+
+        if (valuePtr) {
+            // 复制字符串到内存
+            uc_mem_write(uc, valuePtr, value.c_str(), valueSize);
+            return_value = valuePtr;
+            printf("[*] getenv: Found '%s'='%s' at 0x%llx\n", name,
+                   value.c_str(), valuePtr);
+        }
+    } else {
+        printf("[*] getenv: Env var '%s' not found\n", name);
+    }
+
+    // 设置返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_value);
+}

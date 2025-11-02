@@ -1,0 +1,452 @@
+#pragma once
+
+#include "head.h"
+#include <wininet.h>
+#define PAGE_SIZE 0x1000
+#define CF_MASK (1 << 0)
+#define PF_MASK (1 << 2)
+#define ZF_MASK (1 << 6)
+#define SF_MASK (1 << 7)
+#define OF_MASK (1 << 11)
+#define ALL_MASK (OF_MASK | SF_MASK | ZF_MASK | PF_MASK | CF_MASK)
+// 随便瞎JB写的
+#define STACK_BASE_64 0x14A0000
+#define STACK_BASE_32 0x14A0000
+#define STACK_SIZE_64 0x40000
+#define STACK_SIZE_32 0x40000
+#define HEAP_ADDRESS_64 0x500000000
+#define HEAP_SIZE_64 0x5000000
+#define HEAP_ADDRESS_32 0x5000000
+#define HEAP_SIZE_32 0x5000000
+#define ENV_BLOCK_BASE 0x50000
+#define DLL_MODULE_BASE 0x130000
+
+#define PEB_BASE 0x90000
+#define TEB_BASE 0x90000
+#define CMDLINE_ADDRESS 0x100000   // 命令行字符串的固定地址
+#define CMDLINEW_ADDRESS 0x110000  // 宽字符命令行字符串的固定地址
+
+#define X86_GDT_ADDR 0x30000
+#define X86_GDT_LIMIT 0x1000
+#define X86_GDT_ENTRY_SIZE 0x8
+
+#define API_FUNCTION_SIZE 8
+#define PAGE_ALIGN(Va) (ULONG_PTR)(Va) & ~(PAGE_SIZE - 1)
+#define PAGE_ALIGN_64(Va) (Va) & ~(0x1000ull - 1)
+#define PAGE_ALIGN_64k(Va) ((Va)) & ~(0x10000ull - 1)
+#define AlignSize(Size, Align) (Size + Align - 1) / Align* Align
+
+enum class WinVer {
+    kWin7 = 0x0610,
+    kWin7SP1 = 0x0611,
+    kWin8 = 0x0620,
+    kWin81 = 0x0630,
+    kWin10 = 0x0A00,
+    kWin10RS1 = 0x0A01,   // Anniversary update
+    kWin10RS2 = 0x0A02,   // Creators update
+    kWin10RS3 = 0x0A03,   // Fall creators update
+    kWin10RS4 = 0x0A04,   // Spring creators update
+    kWin10RS5 = 0x0A05,   // October 2018 update
+    kWin1019H1 = 0x0A06,  // May 2019 update 19H1
+    kWin1019H2 = 0x0A07,  // November 2019 update 19H2
+    kWin1020H1 = 0x0A08   // April 2020 update 20H1
+};
+struct _fakeApi {
+    std::function<void(void*, uc_engine*, uint64_t)> func;
+    uint32_t paramCount;
+};
+
+// 添加堆管理相关的结构定义
+struct HeapBlock {
+    uint64_t address;  // 块的起始地址
+    size_t size;       // 块的大小
+    bool is_free;      // 是否是空闲块
+    HeapBlock* next;   // 下一个块
+    HeapBlock* prev;   // 上一个块
+};
+
+struct HeapSegment {
+    uint64_t base;      // 堆段的基址
+    size_t size;        // 堆段的总大小
+    HeapBlock* blocks;  // 块链表
+};
+enum class MalwareAnalysisType {
+    kNone,
+    kSuspicious,
+    kMalware,
+};
+struct InternetHandleInfo {
+    HINTERNET handle;
+    bool isConnection;
+    std::string url;
+    std::vector<char> responseData;
+    size_t currentPosition;
+};
+
+class Sandbox {
+    friend class cFixImprot;  // 声明cFixImprot为友元类
+   public:
+    // WFP引擎相关结构体
+    struct FakeWFPEngine {
+        bool isOpen;
+        std::vector<FWPM_PROVIDER0> providers;
+        std::vector<FWPM_FILTER0> filters;
+    };
+
+    Sandbox();
+    ~Sandbox();
+    std::map<uint64_t, size_t>
+        process_enum_state;  // 用于跟踪每个句柄的枚举状态
+    // Public methods
+    auto InitEnv(std::shared_ptr<BasicPeInfo> peInfo) -> void;
+    auto Run(uint64_t address = 0) -> void;
+    auto GetCapstoneHandle() const -> csh { return m_csHandle; }
+    auto GetUnicornHandle() const -> uc_engine* { return m_ucEngine; }
+    auto GetPeInfo() const -> std::shared_ptr<BasicPeInfo> { return m_peInfo; }
+    auto GetModuleList() const -> std::vector<std::shared_ptr<struct_moudle>> {
+        return m_moduleList;
+    }
+    auto EmulateApi(uc_engine* uc, uint64_t address, uint64_t rip,
+                    std::string ApiName) -> bool;
+    auto GetPeb32() -> X32PEB* { return &m_peb32; }
+    auto GetPeb64() -> X64PEB* { return &m_peb64; }
+    auto GetTeb32() -> X32TEB* { return &m_teb32; }
+    auto GetTeb64() -> X64TEB* { return &m_teb64; }
+    auto GetCommandLine() const -> const char* { return m_commandLine.c_str(); }
+    auto GetCommandLineAddress() const -> uint64_t { return CMDLINE_ADDRESS; }
+    auto GetCommandLineWAddress() const -> uint64_t { return CMDLINEW_ADDRESS; }
+    auto GetEnvStrings() const -> std::vector<std::wstring> {
+        return envStrings;
+    }
+    auto GetEnvString() -> std::vector<wchar_t>;
+    auto GetEnvStringsSize() -> size_t;
+    auto InitCommandLine() -> void;
+
+    // 内存分配相关的方法
+    auto AllocateMemory(size_t size) -> uint64_t;
+
+    // 堆管理相关的公共方法
+    auto CreateHeapSegment(uint64_t base, size_t size) -> HeapSegment*;
+    auto AllocateFromSegment(HeapSegment* segment, size_t size) -> uint64_t;
+    auto FreeBlock(uint64_t address) -> bool;
+    auto FindHeapSegment(uint64_t address) -> HeapSegment*;
+    auto MergeBlocks(HeapBlock* block) -> void;
+    auto SplitBlock(HeapBlock* block, size_t size) -> void;
+    auto GetEnvBlockBase() const -> uint64_t { return m_envBlockBase; }
+    std::map<uint64_t, HeapSegment*> m_heapSegments;  // 堆段映射表
+    auto GetHeapBlocks() const -> std::map<uint64_t, HeapSegment*> {
+        return m_heapSegments;
+    }
+    auto PrintApiCallList() -> void {
+        for (auto& api : ApiCallList) {
+            printf("%s\n", api.c_str());
+        }
+    }
+
+    // 从内存中提取PE文件并修复重定位和导入表，返回原始PE的缓冲区
+    auto DumpPE() -> std::pair<std::unique_ptr<BYTE[]>, size_t>;
+
+    // 计算PE文件的虚拟内存大小
+    auto getVirtualMemorySize(BYTE* peBuffer) -> size_t;
+
+    // 修复PE区段信息
+    void FixSections(PIMAGE_SECTION_HEADER sectionHeader, WORD numberOfSections,
+                     size_t virtualMemorySize);
+
+    // 更新代码基址和大小
+    void UpdateBaseOfCode(PIMAGE_SECTION_HEADER sectionHeader,
+                          PIMAGE_NT_HEADERS ntHeaders, WORD numberOfSections,
+                          DWORD entryPoint);
+
+    // 对齐到区段对齐值
+    DWORD AlignToSectionAlignment(size_t size, DWORD alignment);
+
+    // 计算PE校验和
+    DWORD CalculateChecksum(const BYTE* buffer, size_t size);
+
+    auto SetupVirtualMachine() -> void;
+    auto PushModuleToVM(const char* dllName, uint64_t moduleBase) -> void;
+    auto processImportModule(const moudle_import* importModule) -> void;
+    auto GetCrossSectionExecution() -> std::vector<uint64_t> {
+        return m_crossSectionExecution;
+    }
+    auto GetLastExecuteSectionIndex() -> uint64_t {
+        return m_lastExecuteSectionIndex;
+    }
+    auto SetLastExecuteSectionIndex(uint64_t index) -> void {
+        m_lastExecuteSectionIndex = index;
+    }
+    auto SetCrossSectionExecution(uint64_t address) -> void {
+        return m_crossSectionExecution.push_back(address);
+    }
+    auto GetMalwareAnalysisType() -> MalwareAnalysisType {
+        return m_malwareAnalysisType;
+    }
+    auto SetMalwareAnalysisType(MalwareAnalysisType type) -> void {
+        if (type == MalwareAnalysisType::kMalware &&
+            m_malwareAnalysisType == MalwareAnalysisType::kSuspicious) {
+            m_malwareAnalysisType = type;
+        } else if (m_malwareAnalysisType == MalwareAnalysisType::kNone) {
+            m_malwareAnalysisType = type;
+        }
+    }
+    auto CheckMalwareActive_Registry(std::wstring registryPath) -> void;
+
+    auto CheckMalwareActive_Sleep(uint32_t secToSleep) -> void;
+
+    auto CheckMalwareActive_GetProcAddress(std::string wantName) -> void;
+
+    auto CheckMalwareActive_FilePath(std::wstring filePath) -> void;
+
+    // WinHTTP API相关方法
+    auto GetNextInternetHandle() -> uint64_t { return m_nextInternetHandle++; }
+
+    auto AddInternetHandle(uint64_t handle, const InternetHandleInfo& info)
+        -> void {
+        m_internetHandles[handle] = info;
+    }
+
+    auto GetInternetHandle(uint64_t handle) -> InternetHandleInfo* {
+        auto it = m_internetHandles.find(handle);
+        if (it != m_internetHandles.end()) {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
+    auto RemoveInternetHandle(uint64_t handle) -> bool {
+        return m_internetHandles.erase(handle) > 0;
+    }
+
+    auto GetAllInternetHandles() -> std::map<uint64_t, InternetHandleInfo>& {
+        return m_internetHandles;
+    }
+    std::vector<std::string> ApiCallList;
+
+    // WFP引擎相关方法
+    auto GetWfpEngines() -> std::map<HANDLE, FakeWFPEngine*>& {
+        return m_wfpEngines;
+    }
+    auto GetNextWfpEngineHandle() -> HANDLE {
+        auto handle = m_nextWfpEngineHandle;
+        m_nextWfpEngineHandle = (HANDLE)((uint64_t)m_nextWfpEngineHandle + 1);
+        return handle;
+    }
+    auto GetImpFuncDict() -> std::vector<std::shared_ptr<moudle_import>> {
+        return m_impFuncDict;
+    }
+    auto GetLastImpRead()
+        -> std::pair<uint64_t, std::shared_ptr<moudle_import>> {
+        return m_lastImpRead;
+    }
+    auto SetLastImpRead(uint64_t address, std::shared_ptr<moudle_import> imp)
+        -> void {
+        m_lastImpRead = {address, imp};
+    }
+
+    // 注册COM相关API
+    void RegisterComApis();
+
+   private:
+    std::shared_ptr<BasicPeInfo> m_peInfo;
+    std::pair<uint64_t, std::shared_ptr<moudle_import>> m_lastImpRead;
+    uint64_t m_usedModuleBase;
+    uint64_t m_gsBase;
+    uint64_t m_pebBase;
+    uint64_t m_pebEnd;
+    uint64_t m_tebBase;
+    uint64_t m_tebEnd;
+    PVOID m_stackBuffer;  // 没有释放
+    uint64_t m_stackBase;
+    uint64_t m_stackSize;
+    uint64_t m_stackEnd;
+    uint64_t m_heapBase;
+    uint64_t m_heapSize;
+    uint64_t m_heapEnd;
+    uint64_t m_fakeBase;
+    uint64_t m_envBlockBase;
+    struct_gs_base m_gsBaseStruct = {0};
+    X64TEB m_teb64 = {0};
+    X64PEB m_peb64 = {0};
+    X32TEB m_teb32 = {0};
+    X32PEB m_peb32 = {0};
+    csh m_csHandle;         // Capstone handle
+    uc_engine* m_ucEngine;  // Unicorn engine handle
+    std::vector<std::shared_ptr<moudle_import>> m_impFuncDict;
+    std::vector<std::shared_ptr<moudle_export>> m_exportFuncDict;
+    std::vector<std::shared_ptr<struct_moudle>> m_moduleList;
+    std::vector<std::shared_ptr<moudle_import_ordinal>> m_impFuncOrdinalDict;
+
+    std::map<std::string, std::shared_ptr<_fakeApi>> api_map;
+    std::string m_commandLine;  // 存储命令行字符串
+    // 创建一些基本的环境变量
+    std::vector<std::wstring> envStrings = {
+        L"ALLUSERSPROFILE=C:\\ProgramData",
+        L"APPDATA=C:\\Users\\User\\AppData\\Roaming",
+        L"CommonProgramFiles=C:\\Program Files\\Common Files",
+        L"COMPUTERNAME=DESKTOP",
+        L"ComSpec=C:\\Windows\\system32\\cmd.exe",
+        L"HOMEDRIVE=C:",
+        L"HOMEPATH=\\Users\\User",
+        L"LOCALAPPDATA=C:\\Users\\User\\AppData\\Local",
+        L"NUMBER_OF_PROCESSORS=8",
+        L"OS=Windows_NT",
+        L"Path=C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem",
+        L"PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+        L"PROCESSOR_ARCHITECTURE=AMD64",
+        L"ProgramData=C:\\ProgramData",
+        L"ProgramFiles=C:\\Program Files",
+        L"PROMPT=$P$G",
+        L"SystemDrive=C:",
+        L"SystemRoot=C:\\Windows",
+        L"TEMP=C:\\Users\\huoji\\AppData\\Local\\Temp",
+        L"TMP=C:\\Users\\huoji\\AppData\\Local\\Temp",
+        L"USERDOMAIN=DESKTOP",
+        L"USERNAME=User",
+        L"USERPROFILE=C:\\Users\\huoji",
+        L"windir=C:\\Windows"};
+    auto ResoveImport() -> void;
+    auto ResolveImportExports() -> void;
+    auto CreateModuleInfo(const char* dllName, uint64_t moduleBase,
+                          uint64_t realModuleBase, uint64_t bufferAddress)
+        -> std::shared_ptr<struct_moudle>;
+    auto ResolveExport(uint64_t moduleBase)
+        -> std::vector<std::shared_ptr<moudle_export>>;
+    auto InitApiHooks() -> void;
+    auto InitCommandLine(std::string commandLine) -> void;
+    auto mapSystemModuleToVmByName(std::string systemName) -> void;
+    std::vector<uint64_t> m_crossSectionExecution;  // 记录跨区段执行地址
+    uint64_t m_lastExecuteSectionIndex = 0;         // 上次执行的区段索引
+    uint64_t m_KSharedUserDataBase{0};
+    uint64_t m_KSharedUserDataSize{0};
+
+    MalwareAnalysisType m_malwareAnalysisType = MalwareAnalysisType::kNone;
+
+    // WinHTTP API相关成员变量
+    std::map<uint64_t, InternetHandleInfo> m_internetHandles;
+    uint64_t m_nextInternetHandle = 0x1000;
+
+    // 初始化PEB的LDR数据结构
+    auto InitializeLdrData() -> void;
+
+    // 将模块添加到LDR链表中
+    auto AddModuleToLdr(const std::shared_ptr<struct_moudle>& module) -> void;
+
+    // 创建LDR_DATA_TABLE_ENTRY结构
+    auto CreateLdrEntry(const std::shared_ptr<struct_moudle>& module,
+                        uint64_t entryAddress, uint64_t fullNameAddress,
+                        uint64_t baseNameAddress) -> LDR_DATA_TABLE_ENTRY;
+
+    // 更新LDR链表
+    auto UpdateLdrLinks(const LDR_DATA_TABLE_ENTRY& entry,
+                        uint64_t entryAddress, X64_PEB_LDR_DATA& ldrData)
+        -> void;
+
+    // WFP引擎相关成员
+    std::map<HANDLE, FakeWFPEngine*> m_wfpEngines;
+    HANDLE m_nextWfpEngineHandle;
+};
+std::string getDllNameFromApiSetMap(const std::string& apiSet);
+void Api_GetLastError(void* sandbox, uc_engine* uc, uint64_t address);
+auto Api_InitializeCriticalSectionAndSpinCount(void* sandbox, uc_engine* uc,
+                                               uint64_t address) -> void;
+auto Api_InitializeCriticalSectionEx(void* sandbox, uc_engine* uc,
+                                     uint64_t address) -> void;
+auto Api_IsProcessorFeaturePresent(void* sandbox, uc_engine* uc,
+                                   uint64_t address) -> void;
+auto Api_DeleteCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_TlsAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_TlsSetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api___set_app_type(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api___p__fmode(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_RegOpenKeyExW(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_RegCloseKey(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_AreFileApisANSI(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_WideCharToMultiByte(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_InitializeSListHead(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetEnvironmentStringsW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_FreeEnvironmentStringsW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetProcessHeap(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_HeapAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_HeapFree(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_TlsGetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_SetLastError(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_EnterCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_LeaveCriticalSection(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetStartupInfoW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetStdHandle(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_GetFileType(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_HeapCreate(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_GetCommandLineA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetCommandLineW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetACP(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_GetCPInfo(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_MultiByteToWideChar(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_SHGetKnownFolderPath(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_EncodePointer(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_Process32NextW(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CreateToolhelp32Snapshot(void* sandbox, uc_engine* uc,
+                                  uint64_t address) -> void;
+auto Api_Process32FirstW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_VirtualQuery(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_GetModuleHandleW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetModuleHandleA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto GetModuleHandleInternal(void* sandbox, const std::wstring& moduleName)
+    -> HMODULE;
+auto Api_Process32NextW(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_WlanOpenHandle(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_WlanEnumInterfaces(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_WlanGetProfileList(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_WlanFreeMemory(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_WlanCloseHandle(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_ReadFile(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CreatePipe(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CloseHandle(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_RtlFormatCurrentUserKeyPath(void* sandbox, uc_engine* uc,
+                                     uint64_t address) -> void;
+auto Api_FlsSetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CreateFileW(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_WriteFile(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CreateProcessA(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_CreateProcessW(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_GetCurrentProcess(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetCurrentThread(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_OpenProcessToken(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_GetTokenInformation(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+
+// WFP API函数声明
+auto Api_FwpmEngineOpen0(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_FwpmProviderAdd0(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_FwpmFilterAdd0(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_FwpmEngineClose0(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+auto Api_TlsFree(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_FlsAlloc(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_FlsGetValue(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api__initterm_e(void* sandbox, uc_engine* uc, uint64_t address) -> void;
+auto Api_getenv(void* sandbox, uc_engine* uc, uint64_t address) -> void;

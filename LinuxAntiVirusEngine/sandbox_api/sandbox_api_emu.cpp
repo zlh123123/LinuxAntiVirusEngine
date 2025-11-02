@@ -1,0 +1,1576 @@
+#include "sandbox.h"
+#include "sandbox_callbacks.h"
+#include "sandbox_api_winhttp.h"
+#include "sandbox_api_com.h"
+#include <tlhelp32.h>
+
+auto Api_QueryPerformanceCounter(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t return_params_address = 0;
+    LARGE_INTEGER data;
+    BOOL origin_return_value = QueryPerformanceCounter(&data);
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &return_params_address);
+    } else {
+        uint64_t ebp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &ebp_address);
+        ebp_address += 0x4;
+        uc_mem_read(uc, ebp_address, &return_params_address, 0x4);
+    }
+    uc_mem_write(uc, return_params_address, &data, sizeof(LARGE_INTEGER));
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &origin_return_value);
+}
+auto Api_GetSystemTimeAsFileTime(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    uint64_t rcx;
+    FILETIME file_time;
+    GetSystemTimeAsFileTime(&file_time);
+    uc_reg_read(uc, UC_X86_REG_RCX, &rcx);
+    uc_mem_write(uc, rcx, &file_time, sizeof(FILETIME));
+}
+void Api_GetCurrentThreadId(void* sandbox, uc_engine* uc, uint64_t address) {
+    auto context = static_cast<Sandbox*>(sandbox);
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_write(uc, UC_X86_REG_RAX,
+                     &context->GetTeb64()->ClientId.UniqueThread);
+    } else {
+        uc_reg_write(uc, UC_X86_REG_RAX,
+                     &context->GetTeb32()->ClientId.UniqueThread);
+    }
+}
+void Api_GetCurrentProcessId(void* sandbox, uc_engine* uc, uint64_t address) {
+    auto context = static_cast<Sandbox*>(sandbox);
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_write(uc, UC_X86_REG_RAX,
+                     &context->GetTeb64()->ClientId.UniqueProcess);
+    } else {
+        uc_reg_write(uc, UC_X86_REG_RAX,
+                     &context->GetTeb32()->ClientId.UniqueProcess);
+    }
+}
+auto Api_GetCurrentThread(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // GetCurrentThread 总是返回伪句柄值 -1 (0xFFFFFFFF)
+    uint64_t pseudo_handle = static_cast<uint64_t>(-1);
+
+    // 根据架构写入返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &pseudo_handle);
+
+    printf("[*] GetCurrentThread called, returning pseudo-handle 0x%llx\n",
+           pseudo_handle);
+}
+auto Api_LoadLibraryA(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t params_address = 0;
+
+    // 获取参数地址
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &params_address);
+    } else {
+        uint64_t ebp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &ebp_address);
+        ebp_address += 0x4;
+        uc_mem_read(uc, ebp_address, &params_address, 0x4);
+    }
+
+    uint64_t return_address = 0;
+    std::string module_name;
+    char buffer[MAX_PATH];
+    size_t i = 0;
+
+    // 读取模块名称
+    if (params_address != 0) {
+        do {
+            uint8_t byte;
+            uc_mem_read(uc, params_address + i, &byte, 1);
+            buffer[i] = byte;
+            i++;
+        } while (buffer[i - 1] != 0 && i < MAX_PATH);
+
+        if (i > 0 && i < MAX_PATH) {
+            module_name = std::string(buffer);
+            // 确保模块名以.dll结尾（不区分大小写）
+            if (module_name.length() > 4) {
+                std::string ext = module_name.substr(module_name.length() - 4);
+                if (_stricmp(ext.c_str(), ".dll") != 0) {
+                    module_name += ".dll";
+                }
+            } else {
+                module_name += ".dll";
+            }
+            std::string fuck_up_api_ms = module_name;
+            if (fuck_up_api_ms.find("api-ms-") != std::string::npos) {
+                module_name = getDllNameFromApiSetMap(fuck_up_api_ms);
+                if (module_name.size() <= 1) __debugbreak();
+            }
+
+            // 从模块列表中查找对应模块
+            for (const auto& module : context->GetModuleList()) {
+                if (_stricmp((*module).name, module_name.c_str()) == 0) {
+                    return_address = (*module).base;
+                    break;
+                }
+            }
+        }
+    }
+
+    printf("[*] LoadLibraryA: Module=%s, Base=0x%llx\n", module_name.c_str(),
+           return_address);
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_address);
+}
+auto Api_LoadLibraryExW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t module_name_address = 0;
+    uint64_t flags = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpLibFileName, r8 = dwFlags
+        uc_reg_read(uc, UC_X86_REG_RCX, &module_name_address);
+        uc_reg_read(uc, UC_X86_REG_R8, &flags);
+    } else {
+        // x86: 从栈上读取参数
+        uint64_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &module_name_address, 0x4);
+        esp_address += 0x8;  // 跳过hFile参数
+        uc_mem_read(uc, esp_address, &flags, 0x4);
+    }
+
+    uint64_t return_address = 0;
+    std::wstring module_name;
+    wchar_t buffer[MAX_PATH];
+    size_t i = 0;
+    bool isApiSetMapMeme = false;
+    // 读取宽字符模块名称
+    if (module_name_address != 0) {
+        do {
+            uint16_t wchar;
+            uc_mem_read(uc, module_name_address + (i * 2), &wchar, 2);
+            buffer[i] = wchar;
+            i++;
+        } while (buffer[i - 1] != 0 && i < MAX_PATH);
+
+        if (i > 0 && i < MAX_PATH) {
+            module_name = std::wstring(buffer);
+            std::string ansi_name(module_name.begin(), module_name.end());
+
+            std::string fuck_up_api_ms = ansi_name;
+            if (ansi_name.length() > 4) {
+                std::string ext = ansi_name.substr(ansi_name.length() - 4);
+                if (_stricmp(ext.c_str(), ".dll") != 0) {
+                    ansi_name += ".dll";
+                }
+            } else {
+                ansi_name += ".dll";
+            }
+            if (ansi_name.find("api-ms-") != std::string::npos) {
+                ansi_name = getDllNameFromApiSetMap(ansi_name);
+                isApiSetMapMeme = true;
+                // if (ansi_name.size() <= 1) __debugbreak();
+            }
+
+            // 从模块列表中查找对应模块
+            for (const auto& module : context->GetModuleList()) {
+                if (_stricmp((*module).name, ansi_name.c_str()) == 0) {
+                    return_address = (*module).base;
+                    break;
+                }
+            }
+        }
+    }
+
+    printf("[*] LoadLibraryExW: Module=%ls, Flags=0x%llx, Base=0x%llx\n",
+           module_name.c_str(), flags, return_address);
+    if (return_address == 0 && isApiSetMapMeme) {
+        // 找不到就不管他了,操
+        return_address = 0x1337;
+    }
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_address);
+}
+auto Api_GetProcAddress(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t moduleHandle = 0;
+    uint64_t functionNameAddr = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = hModule, rdx = lpProcName
+        uc_reg_read(uc, UC_X86_REG_RCX, &moduleHandle);
+        uc_reg_read(uc, UC_X86_REG_RDX, &functionNameAddr);
+    } else {
+        // x86: 从栈上读取参数
+        uint64_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_handle = 0;
+        uint32_t temp_name_addr = 0;
+        uc_mem_read(uc, esp_address, &temp_handle, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &temp_name_addr, sizeof(uint32_t));
+        moduleHandle = temp_handle;
+        functionNameAddr = temp_name_addr;
+    }
+
+    uint64_t return_address = 0;
+
+    // 读取函数名
+    if (functionNameAddr == 0) {
+        __debugbreak();
+    }
+    // 通过名称查找
+    char functionName[256] = {0};
+    size_t i = 0;
+    do {
+        uint8_t byte;
+        uc_mem_read(uc, functionNameAddr + i, &byte, 1);
+        functionName[i] = byte;
+        i++;
+    } while (functionName[i - 1] != 0 && i < sizeof(functionName));
+    context->CheckMalwareActive_GetProcAddress(functionName);
+    // 在模块列表中查找对应模块
+    for (const auto& module : context->GetModuleList()) {
+        if (module->base == moduleHandle) {
+            // 遍历导出函数查找对应名称
+            for (const auto& exp : module->export_function) {
+                // 使用 _stricmp 进行大小写不敏感的比较
+                if (_stricmp(exp->name, functionName) == 0) {
+                    return_address = module->base + exp->function_address;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    printf("[*] GetProcAddress: Module=0x%llx, Function=%s, Address=0x%llx\n",
+           moduleHandle, functionName, return_address);
+
+    // 设置返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &return_address);
+}
+
+auto Sandbox::FreeBlock(uint64_t address) -> bool {
+    // 查找包含此地址的堆段
+    HeapSegment* segment = FindHeapSegment(address);
+    if (!segment) return false;
+
+    // 查找对应的块
+    HeapBlock* current = segment->blocks;
+    while (current != nullptr) {
+        if (current->address == address) {
+            if (current->is_free) return false;  // 已经是空闲的
+
+            current->is_free = true;
+            MergeBlocks(current);  // 尝试合并相邻的空闲块
+            return true;
+        }
+        current = current->next;
+    }
+
+    return false;
+}
+
+auto Sandbox::FindHeapSegment(uint64_t address) -> HeapSegment* {
+    for (auto& pair : m_heapSegments) {
+        HeapSegment* segment = pair.second;
+        if (address >= segment->base &&
+            address < segment->base + segment->size) {
+            return segment;
+        }
+    }
+    return nullptr;
+}
+
+auto Sandbox::MergeBlocks(HeapBlock* block) -> void {
+    // 与后一个块合并
+    if (block->next && block->next->is_free) {
+        block->size += block->next->size;
+        HeapBlock* temp = block->next;
+        block->next = temp->next;
+        if (block->next) {
+            block->next->prev = block;
+        }
+        delete temp;
+    }
+
+    // 与前一个块合并
+    if (block->prev && block->prev->is_free) {
+        block->prev->size += block->size;
+        block->prev->next = block->next;
+        if (block->next) {
+            block->next->prev = block->prev;
+        }
+        delete block;
+    }
+}
+
+auto Sandbox::SplitBlock(HeapBlock* block, size_t size) -> void {
+    size_t remaining_size = block->size - size;
+    block->size = size;
+
+    auto new_block = new HeapBlock();
+    new_block->address = block->address + size;
+    new_block->size = remaining_size;
+    new_block->is_free = true;
+    new_block->next = block->next;
+    new_block->prev = block;
+
+    if (block->next) {
+        block->next->prev = new_block;
+    }
+    block->next = new_block;
+}
+
+auto Sandbox::InitCommandLine(std::string commandLine) -> void {
+    // 设置默认的命令行字符串
+    m_commandLine = commandLine;
+
+    // 将ANSI命令行字符串写入模拟内存
+    uc_mem_map(m_ucEngine, CMDLINE_ADDRESS, PAGE_SIZE,
+               UC_PROT_READ | UC_PROT_WRITE);
+    uc_mem_write(m_ucEngine, CMDLINE_ADDRESS, m_commandLine.c_str(),
+                 m_commandLine.length() + 1);
+
+    // 为宽字符命令行分配内存
+    uc_mem_map(m_ucEngine, CMDLINEW_ADDRESS, PAGE_SIZE,
+               UC_PROT_READ | UC_PROT_WRITE);
+
+    // 将ANSI字符串转换为宽字符字符串
+    std::wstring wCommandLine(m_commandLine.begin(), m_commandLine.end());
+
+    // 写入宽字符命令行字符串
+    uc_mem_write(m_ucEngine, CMDLINEW_ADDRESS, wCommandLine.c_str(),
+                 (wCommandLine.length() + 1) * sizeof(wchar_t));
+}
+
+auto Api_GetModuleFileNameW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t hModule = 0;
+    uint64_t lpFilename = 0;
+    uint32_t nSize = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = hModule, rdx = lpFilename, r8 = nSize
+        uc_reg_read(uc, UC_X86_REG_RCX, &hModule);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpFilename);
+        uint64_t temp_size;
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_size);
+        nSize = static_cast<uint32_t>(temp_size);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uint32_t temp_module = 0;
+        uint32_t temp_filename = 0;
+        uc_mem_read(uc, esp_address, &temp_module, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &temp_filename, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x8, &nSize, sizeof(uint32_t));
+        hModule = temp_module;
+        lpFilename = temp_filename;
+    }
+
+    uint32_t result = 0;
+
+    // 验证参数
+    if (lpFilename == 0 || nSize == 0) {
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        return;
+    }
+
+    std::wstring modulePath;
+    if (hModule == 0) {
+        // 如果hModule为NULL,返回主模块(PE文件)的路径
+        modulePath = std::wstring(context->GetPeInfo()->inputFilePath.begin(),
+                                  context->GetPeInfo()->inputFilePath.end());
+    } else {
+        // 在模块列表中查找对应模块
+        bool found = false;
+        for (const auto& module : context->GetModuleList()) {
+            if (module->base == hModule) {
+                // 构建完整的模块路径
+                char windowsPath[MAX_PATH];
+                GetWindowsDirectoryA(windowsPath, sizeof(windowsPath));
+
+                // 根据PE架构选择正确的系统目录
+                const std::string systemDir = context->GetPeInfo()->isX64
+                                                  ? "\\System32\\"
+                                                  : "\\SysWOW64\\";
+
+                std::string fullPath =
+                    std::string(windowsPath) + systemDir + module->name;
+                modulePath = std::wstring(fullPath.begin(), fullPath.end());
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            DWORD error = ERROR_MOD_NOT_FOUND;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+            uc_reg_write(
+                uc,
+                context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                &result);
+            return;
+        }
+    }
+
+    // 检查缓冲区大小是否足够
+    if (nSize < modulePath.length() + 1) {
+        // 缓冲区太小,返回所需大小
+        result = static_cast<uint32_t>(modulePath.length() + 1);
+        DWORD error = ERROR_INSUFFICIENT_BUFFER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    } else {
+        // 写入路径到缓冲区
+        if (uc_mem_write(uc, lpFilename, modulePath.c_str(),
+                         (modulePath.length() + 1) * sizeof(wchar_t)) ==
+            UC_ERR_OK) {
+            result = static_cast<uint32_t>(modulePath.length());
+        } else {
+            result = 0;
+            DWORD error = ERROR_INVALID_PARAMETER;
+            if (context->GetPeInfo()->isX64) {
+                context->GetTeb64()->LastErrorValue = error;
+            } else {
+                context->GetTeb32()->LastErrorValue = error;
+            }
+        }
+    }
+
+    printf(
+        "[*] GetModuleFileNameW: Module=0x%llx, Buffer=0x%llx, Size=%u, "
+        "Result=%u, Path=%ls\n",
+        hModule, lpFilename, nSize, result, modulePath.c_str());
+
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+// 实现 SetUnhandledExceptionFilter API
+auto Api_SetUnhandledExceptionFilter(void* sandbox, uc_engine* uc,
+                                     uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpTopLevelExceptionFilter = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpTopLevelExceptionFilter
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpTopLevelExceptionFilter);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uint32_t temp_filter = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+        uc_mem_read(uc, esp_address, &temp_filter, sizeof(uint32_t));
+        lpTopLevelExceptionFilter = temp_filter;
+    }
+
+    // 简单实现：返回NULL表示没有之前的过滤器
+    uint64_t prev_filter = 0;
+
+    printf("[*] SetUnhandledExceptionFilter: Filter=0x%llx\n",
+           lpTopLevelExceptionFilter);
+
+    // 返回之前的过滤器（在这里始终返回NULL）
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &prev_filter);
+}
+
+// 将Windows VirtualProtect保护标志转换为Unicorn内存保护标志
+uint32_t WindowsToUnicornProtect(uint32_t windowsProtect) {
+    uint32_t unicornProtect = UC_PROT_NONE;
+
+    // 转换基本属性
+    if (windowsProtect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                          PAGE_EXECUTE_READWRITE)) {
+        unicornProtect |= UC_PROT_READ;
+    }
+
+    if (windowsProtect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+        unicornProtect |= UC_PROT_WRITE;
+    }
+
+    if (windowsProtect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+        unicornProtect |= UC_PROT_EXEC;
+    }
+
+    // 如果没有有效标志，至少给予读权限以防崩溃
+    if (unicornProtect == UC_PROT_NONE && windowsProtect != PAGE_NOACCESS) {
+        unicornProtect = UC_PROT_READ;
+    }
+
+    return unicornProtect;
+}
+
+auto Api_VirtualProtect(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpAddress = 0;
+    uint64_t dwSize = 0;
+    uint32_t flNewProtect = 0;
+    uint64_t lpflOldProtect = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpAddress, rdx = dwSize, r8 = flNewProtect, r9 =
+        // lpflOldProtect
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpAddress);
+        uc_reg_read(uc, UC_X86_REG_RDX, &dwSize);
+        uint64_t temp_protect;
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_protect);
+        flNewProtect = static_cast<uint32_t>(temp_protect);
+        uc_reg_read(uc, UC_X86_REG_R9, &lpflOldProtect);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uint32_t temp_address;
+        uc_mem_read(uc, esp_address, &temp_address, sizeof(uint32_t));
+        lpAddress = temp_address;
+        esp_address += 0x4;
+
+        uint32_t temp_size;
+        uc_mem_read(uc, esp_address, &temp_size, sizeof(uint32_t));
+        dwSize = temp_size;
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &flNewProtect, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_old_protect;
+        uc_mem_read(uc, esp_address, &temp_old_protect, sizeof(uint32_t));
+        lpflOldProtect = temp_old_protect;
+    }
+
+    // 检查参数有效性
+    if (lpAddress == 0 || dwSize == 0 || lpflOldProtect == 0) {
+        uint64_t result = 0;  // FALSE
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+
+        // 设置错误码 - ERROR_INVALID_PARAMETER
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        return;
+    }
+
+    // 检查地址范围是否已映射
+    uint32_t unicornProtect = WindowsToUnicornProtect(flNewProtect);
+    // 对齐地址和大小到页面边界
+    uint64_t aligned_address =
+        lpAddress & ~(PAGE_SIZE - 1);  // 向下对齐到页面边界
+    uint64_t end_address = (lpAddress + dwSize + PAGE_SIZE - 1) &
+                           ~(PAGE_SIZE - 1);  // 向上对齐到页面边界
+    uint64_t aligned_size = end_address - aligned_address;
+
+    uc_err err =
+        uc_mem_protect(uc, aligned_address, aligned_size, unicornProtect);
+
+    if (err != UC_ERR_OK) {
+        uint64_t result = 0;  // FALSE
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+
+        // 设置错误码 - ERROR_INVALID_ADDRESS
+        DWORD error = ERROR_INVALID_ADDRESS;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        return;
+    }
+
+    // 模拟的旧保护属性，这里简化为一个默认值
+    // 实际应用中，应该从内存映射表中获取
+    uint32_t oldProtect = PAGE_READWRITE;
+
+    // 写入旧保护值到lpflOldProtect指向的内存
+    uc_mem_write(uc, lpflOldProtect, &oldProtect, sizeof(uint32_t));
+
+    // 调试输出
+    printf(
+        "[*] VirtualProtect: Address=0x%llx, Size=0x%llx, WindowsProtect=0x%x, "
+        "UnicornProtect=0x%x, OldProtect=0x%x\n",
+        lpAddress, dwSize, flNewProtect, unicornProtect, oldProtect);
+
+    // 设置返回值为TRUE
+    uint64_t result = 1;  // TRUE
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Api_Sleep(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t milliseconds;
+
+    // 获取参数：dwMilliseconds
+    if (context->GetPeInfo()->isX64) {
+        // 在x64中，参数通过寄存器传递，第一个参数在RCX
+        uc_reg_read(uc, UC_X86_REG_RCX, &milliseconds);
+    } else {
+        // 在x86中，参数通过栈传递
+        uint32_t esp;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+        // 返回地址之后的4字节是第一个参数
+        uc_mem_read(uc, esp + 4, &milliseconds, sizeof(milliseconds));
+    }
+
+    // 打印日志
+    printf("Sleep API called with %u milliseconds\n", milliseconds);
+}
+
+auto Api_OpenThreadToken(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t ThreadHandle = 0;
+    uint64_t DesiredAccess = 0;
+    uint64_t OpenAsSelf = 0;
+    uint64_t TokenHandle = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = ThreadHandle, rdx = DesiredAccess, r8 = OpenAsSelf, r9 =
+        // TokenHandle
+        uc_reg_read(uc, UC_X86_REG_RCX, &ThreadHandle);
+        uc_reg_read(uc, UC_X86_REG_RDX, &DesiredAccess);
+        uint64_t temp_open_as_self;
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_open_as_self);
+        OpenAsSelf = static_cast<uint32_t>(temp_open_as_self);
+        uc_reg_read(uc, UC_X86_REG_R9, &TokenHandle);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uint32_t temp_handle;
+        uc_mem_read(uc, esp_address, &temp_handle, sizeof(uint32_t));
+        ThreadHandle = temp_handle;
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &DesiredAccess, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &OpenAsSelf, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_token_handle;
+        uc_mem_read(uc, esp_address, &temp_token_handle, sizeof(uint32_t));
+        TokenHandle = temp_token_handle;
+    }
+
+    // 创建一个模拟的令牌句柄
+    uint64_t fake_token_handle = 0x1234;  // 使用一个假的令牌句柄
+
+    // 将令牌句柄写入输出参数
+    if (TokenHandle != 0) {
+        if (context->GetPeInfo()->isX64) {
+            uc_mem_write(uc, TokenHandle, &fake_token_handle, sizeof(uint64_t));
+        } else {
+            uint32_t token_handle_32 = static_cast<uint32_t>(fake_token_handle);
+            uc_mem_write(uc, TokenHandle, &token_handle_32, sizeof(uint32_t));
+        }
+    }
+
+    printf(
+        "[*] OpenThreadToken: ThreadHandle=0x%llx, DesiredAccess=0x%x, "
+        "OpenAsSelf=%d, TokenHandle=0x%llx\n",
+        ThreadHandle, DesiredAccess, OpenAsSelf, fake_token_handle);
+
+    // 设置返回值为TRUE
+    uint64_t result = 1;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+auto Api_LookupPrivilegeValueA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpSystemName = 0;
+    uint64_t lpName = 0;
+    uint64_t lpLuid = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpSystemName);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpName);
+        uc_reg_read(uc, UC_X86_REG_R8, &lpLuid);
+    } else {
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;
+
+        uint32_t temp_system_name, temp_name, temp_luid;
+        uc_mem_read(uc, esp_address, &temp_system_name, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &temp_name, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x8, &temp_luid, sizeof(uint32_t));
+
+        lpSystemName = temp_system_name;
+        lpName = temp_name;
+        lpLuid = temp_luid;
+    }
+
+    // 读取权限名称
+    char privName[256] = {0};
+    if (lpName != 0) {
+        size_t i = 0;
+        do {
+            uint8_t byte;
+            uc_mem_read(uc, lpName + i, &byte, 1);
+            privName[i] = byte;
+            i++;
+        } while (privName[i - 1] != 0 && i < sizeof(privName));
+    }
+
+    // 模拟LUID结构
+    LUID luid = {0};
+    if (strcmp(privName, "SeDebugPrivilege") == 0) {
+        luid.LowPart = 20;  // SeDebugPrivilege的典型LUID值
+        luid.HighPart = 0;
+    }
+
+    // 写入LUID到输出参数
+    if (lpLuid != 0) {
+        uc_mem_write(uc, lpLuid, &luid, sizeof(LUID));
+    }
+
+    printf("[*] LookupPrivilegeValueA: SystemName=%s, Name=%s\n",
+           lpSystemName ? "Local" : "NULL", privName);
+
+    // 返回TRUE
+    uint64_t result = 1;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Api_AdjustTokenPrivileges(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t TokenHandle = 0;
+    uint64_t DisableAllPrivileges = 0;
+    uint64_t NewState = 0;
+    uint32_t BufferLength = 0;
+    uint64_t PreviousState = 0;
+    uint64_t ReturnLength = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &TokenHandle);
+        uc_reg_read(uc, UC_X86_REG_RDX, &DisableAllPrivileges);
+        uc_reg_read(uc, UC_X86_REG_R8, &NewState);
+        uint64_t temp_length;
+        uc_reg_read(uc, UC_X86_REG_R9, &temp_length);
+        BufferLength = static_cast<uint32_t>(temp_length);
+        // 从栈上获取剩余参数
+        uint64_t rsp;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp + 0x28, &PreviousState, sizeof(uint64_t));
+        uc_mem_read(uc, rsp + 0x30, &ReturnLength, sizeof(uint64_t));
+    } else {
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;
+
+        uint32_t temp_values[6];
+        for (int i = 0; i < 6; i++) {
+            uc_mem_read(uc, esp_address + (i * 4), &temp_values[i],
+                        sizeof(uint32_t));
+        }
+
+        TokenHandle = temp_values[0];
+        DisableAllPrivileges = temp_values[1];
+        NewState = temp_values[2];
+        BufferLength = temp_values[3];
+        PreviousState = temp_values[4];
+        ReturnLength = temp_values[5];
+    }
+
+    printf("[*] AdjustTokenPrivileges: TokenHandle=0x%llx, DisableAll=%d\n",
+           TokenHandle, (int)DisableAllPrivileges);
+
+    // 返回TRUE
+    uint64_t result = 1;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+
+    // 设置ERROR_NOT_ALL_ASSIGNED
+    DWORD error = ERROR_NOT_ALL_ASSIGNED;  // 1300
+    if (context->GetPeInfo()->isX64) {
+        context->GetTeb64()->LastErrorValue = error;
+    } else {
+        context->GetTeb32()->LastErrorValue = error;
+    }
+}
+auto Api_CreateDirectoryW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint64_t lpPathName = 0;
+    uint64_t lpSecurityAttributes = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = lpPathName, rdx = lpSecurityAttributes
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpPathName);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpSecurityAttributes);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uint32_t temp_path_name, temp_security_attr;
+        uc_mem_read(uc, esp_address, &temp_path_name, sizeof(uint32_t));
+        uc_mem_read(uc, esp_address + 0x4, &temp_security_attr,
+                    sizeof(uint32_t));
+
+        lpPathName = temp_path_name;
+        lpSecurityAttributes = temp_security_attr;
+    }
+
+    // 读取目录路径
+    wchar_t pathBuffer[MAX_PATH] = {0};
+    if (lpPathName != 0) {
+        size_t i = 0;
+        do {
+            uint16_t wchar;
+            uc_mem_read(uc, lpPathName + (i * 2), &wchar, 2);
+            pathBuffer[i] = wchar;
+            i++;
+        } while (pathBuffer[i - 1] != 0 && i < MAX_PATH);
+    }
+
+    // 将宽字符转换为常规字符串用于日志输出
+    std::wstring widePath(pathBuffer);
+    std::string path(widePath.begin(), widePath.end());
+
+    // 在实际的实现中，可能需要检查目录是否已存在
+    // 这里简单地返回成功，不实际创建目录
+    bool success = true;
+
+    // 输出日志
+    printf("[*] CreateDirectoryW: Path=%s, Result=%s\n", path.c_str(),
+           success ? "TRUE" : "FALSE");
+
+    // 设置返回值
+    uint64_t result = success ? 1 : 0;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+
+    // 如果失败，可以设置LastError
+    if (!success) {
+        DWORD error = ERROR_PATH_NOT_FOUND;  // 或其他适当的错误代码
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+    }
+}
+auto Api_GetStringTypeW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t dwInfoType = 0;
+    uint64_t lpSrcStr = 0;
+    int32_t cchSrc = 0;
+    uint64_t lpCharType = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = dwInfoType, rdx = lpSrcStr, r8 = cchSrc, r9 = lpCharType
+        uc_reg_read(uc, UC_X86_REG_RCX, &dwInfoType);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpSrcStr);
+        uint64_t temp_size;
+        uc_reg_read(uc, UC_X86_REG_R8, &temp_size);
+        cchSrc = static_cast<int32_t>(temp_size);
+        uc_reg_read(uc, UC_X86_REG_R9, &lpCharType);
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uc_mem_read(uc, esp_address, &dwInfoType, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_src_str;
+        uc_mem_read(uc, esp_address, &temp_src_str, sizeof(uint32_t));
+        lpSrcStr = temp_src_str;
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &cchSrc, sizeof(int32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_char_type;
+        uc_mem_read(uc, esp_address, &temp_char_type, sizeof(uint32_t));
+        lpCharType = temp_char_type;
+    }
+
+    // 验证参数
+    if (lpSrcStr == 0 || lpCharType == 0) {
+        uint64_t result = 0;  // FALSE
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        return;
+    }
+
+    // 如果cchSrc为负数，计算字符串长度
+    if (cchSrc < 0) {
+        cchSrc = 0;
+        wchar_t temp_char;
+        do {
+            uc_mem_read(uc, lpSrcStr + (cchSrc * 2), &temp_char,
+                        sizeof(wchar_t));
+            cchSrc++;
+        } while (temp_char != 0 && cchSrc < 1024);  // 设置一个合理的上限
+        cchSrc--;  // 不包括null终止符
+    }
+
+    // 读取源字符串
+    std::vector<wchar_t> srcStr(cchSrc);
+    uc_mem_read(uc, lpSrcStr, srcStr.data(), cchSrc * sizeof(wchar_t));
+
+    // 处理每个字符
+    std::vector<WORD> charTypes(cchSrc);
+    for (int i = 0; i < cchSrc; i++) {
+        WORD type = 0;
+        wchar_t ch = srcStr[i];
+
+        switch (dwInfoType) {
+            case CT_CTYPE1: {
+                // 基本字符类型检查
+                if (iswupper(ch)) type |= C1_UPPER;
+                if (iswlower(ch)) type |= C1_LOWER;
+                if (iswdigit(ch)) type |= C1_DIGIT;
+                if (iswspace(ch)) type |= C1_SPACE;
+                if (iswpunct(ch)) type |= C1_PUNCT;
+                if (iswcntrl(ch)) type |= C1_CNTRL;
+                if (ch == L' ' || ch == L'\t') type |= C1_BLANK;
+                if ((ch >= L'0' && ch <= L'9') || (ch >= L'A' && ch <= L'F') ||
+                    (ch >= L'a' && ch <= L'f'))
+                    type |= C1_XDIGIT;
+                if (iswalpha(ch)) type |= C1_ALPHA;
+                if (type == 0) type |= C1_DEFINED;
+                break;
+            }
+            case CT_CTYPE2: {
+                // 简单的双向文本支持
+                if ((ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') ||
+                    (ch >= L'0' && ch <= L'9')) {
+                    type = C2_LEFTTORIGHT;
+                } else if (iswspace(ch)) {
+                    type = C2_WHITESPACE;
+                } else {
+                    type = C2_NOTAPPLICABLE;
+                }
+                break;
+            }
+            case CT_CTYPE3: {
+                // 基本文本处理信息
+                if (iswalpha(ch)) type |= C3_ALPHA;
+                // 这里可以添加更多的C3类型检查
+                break;
+            }
+        }
+        charTypes[i] = type;
+    }
+
+    // 写入结果
+    uc_mem_write(uc, lpCharType, charTypes.data(), cchSrc * sizeof(WORD));
+
+    printf("[*] GetStringTypeW: InfoType=0x%x, StrLen=%d\n", dwInfoType,
+           cchSrc);
+
+    // 返回成功
+    uint64_t result = 1;  // TRUE
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &result);
+}
+
+auto Api_LCMapStringW(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+    uint32_t Locale = 0;
+    uint32_t dwMapFlags = 0;
+    uint64_t lpSrcStr = 0;
+    int32_t cchSrc = 0;
+    uint64_t lpDestStr = 0;
+    int32_t cchDest = 0;
+
+    // 获取参数
+    if (context->GetPeInfo()->isX64) {
+        // x64: rcx = Locale, rdx = dwMapFlags, r8 = lpSrcStr, r9 = cchSrc
+        uc_reg_read(uc, UC_X86_REG_RCX, &Locale);
+        uc_reg_read(uc, UC_X86_REG_RDX, &dwMapFlags);
+        uc_reg_read(uc, UC_X86_REG_R8, &lpSrcStr);
+        uint64_t temp_src_size;
+        uc_reg_read(uc, UC_X86_REG_R9, &temp_src_size);
+        cchSrc = static_cast<int32_t>(temp_src_size);
+
+        // 从栈上读取剩余参数
+        uint64_t rsp;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp + 0x28, &lpDestStr, sizeof(uint64_t));
+        uc_mem_read(uc, rsp + 0x30, &cchDest, sizeof(int32_t));
+    } else {
+        // x86: 从栈上读取参数
+        uint32_t esp_address = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp_address);
+        esp_address += 0x4;  // 跳过返回地址
+
+        uc_mem_read(uc, esp_address, &Locale, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &dwMapFlags, sizeof(uint32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_src_str;
+        uc_mem_read(uc, esp_address, &temp_src_str, sizeof(uint32_t));
+        lpSrcStr = temp_src_str;
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &cchSrc, sizeof(int32_t));
+        esp_address += 0x4;
+
+        uint32_t temp_dest_str;
+        uc_mem_read(uc, esp_address, &temp_dest_str, sizeof(uint32_t));
+        lpDestStr = temp_dest_str;
+        esp_address += 0x4;
+
+        uc_mem_read(uc, esp_address, &cchDest, sizeof(int32_t));
+    }
+
+    // 验证参数
+    if (lpSrcStr == 0) {
+        uint32_t result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        DWORD error = ERROR_INVALID_PARAMETER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        return;
+    }
+
+    // 如果cchSrc为负数，计算源字符串长度
+    if (cchSrc < 0) {
+        cchSrc = 0;
+        wchar_t temp_char;
+        do {
+            uc_mem_read(uc, lpSrcStr + (cchSrc * 2), &temp_char,
+                        sizeof(wchar_t));
+            cchSrc++;
+        } while (temp_char != 0 && cchSrc < 1024);  // 设置一个合理的上限
+        cchSrc--;  // 不包括null终止符
+    }
+
+    // 读取源字符串
+    std::vector<wchar_t> srcStr(cchSrc);
+    uc_mem_read(uc, lpSrcStr, srcStr.data(), cchSrc * sizeof(wchar_t));
+
+    // 如果cchDest为0，返回所需缓冲区大小
+    if (cchDest == 0) {
+        uint32_t required_size = cchSrc;
+        if (dwMapFlags & LCMAP_SORTKEY) {
+            required_size = cchSrc * 2 + 1;  // 排序键通常需要更多空间
+        }
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &required_size);
+        return;
+    }
+
+    // 检查目标缓冲区大小是否足够
+    if (cchDest < cchSrc) {
+        uint32_t result = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+        DWORD error = ERROR_INSUFFICIENT_BUFFER;
+        if (context->GetPeInfo()->isX64) {
+            context->GetTeb64()->LastErrorValue = error;
+        } else {
+            context->GetTeb32()->LastErrorValue = error;
+        }
+        return;
+    }
+
+    // 处理字符串映射
+    std::vector<wchar_t> destStr(cchSrc);
+    for (int i = 0; i < cchSrc; i++) {
+        wchar_t ch = srcStr[i];
+        if (dwMapFlags & LCMAP_UPPERCASE) {
+            destStr[i] = towupper(ch);
+        } else if (dwMapFlags & LCMAP_LOWERCASE) {
+            destStr[i] = towlower(ch);
+        } else {
+            destStr[i] = ch;  // 默认保持不变
+        }
+    }
+
+    // 写入结果
+    if (dwMapFlags & LCMAP_SORTKEY) {
+        // 生成简单的排序键（这里只是一个基本实现）
+        std::vector<BYTE> sortKey(cchSrc * 2 + 1);
+        for (int i = 0; i < cchSrc; i++) {
+            sortKey[i * 2] = static_cast<BYTE>(destStr[i] & 0xFF);
+            sortKey[i * 2 + 1] = static_cast<BYTE>((destStr[i] >> 8) & 0xFF);
+        }
+        sortKey[cchSrc * 2] = 0;  // 终止符
+        uc_mem_write(uc, lpDestStr, sortKey.data(), sortKey.size());
+        uint32_t result = static_cast<uint32_t>(sortKey.size());
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+    } else {
+        // 写入映射后的字符串
+        uc_mem_write(uc, lpDestStr, destStr.data(), cchSrc * sizeof(wchar_t));
+        uint32_t result = cchSrc;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &result);
+    }
+
+    printf(
+        "[*] LCMapStringW: Locale=0x%x, MapFlags=0x%x, SrcLen=%d, DestLen=%d\n",
+        Locale, dwMapFlags, cchSrc, cchDest);
+}
+
+auto Sandbox::InitApiHooks() -> void {
+    auto FakeApi_GetSystemTimeAsFileTime =
+        _fakeApi{.func = Api_GetSystemTimeAsFileTime, .paramCount = 1};
+    auto FakeApi_GetCurrentThreadId =
+        _fakeApi{.func = Api_GetCurrentThreadId, .paramCount = 0};
+    auto FakeApi_GetCurrentProcessId =
+        _fakeApi{.func = Api_GetCurrentProcessId, .paramCount = 0};
+    auto FakeApi_GetCurrentThread =
+        _fakeApi{.func = Api_GetCurrentThread, .paramCount = 0};
+    auto FakeApi_QueryPerformanceCounter =
+        _fakeApi{.func = Api_QueryPerformanceCounter, .paramCount = 1};
+    auto FakeApi_LoadLibraryA =
+        _fakeApi{.func = Api_LoadLibraryA, .paramCount = 1};
+    auto FakeApi_LoadLibraryExW =
+        _fakeApi{.func = Api_LoadLibraryExW, .paramCount = 3};
+    auto FakeApi_GetLastError =
+        _fakeApi{.func = Api_GetLastError, .paramCount = 0};
+    auto FakeApi_InitializeCriticalSectionAndSpinCount = _fakeApi{
+        .func = Api_InitializeCriticalSectionAndSpinCount, .paramCount = 2};
+    auto FakeApi_InitializeCriticalSectionEx =
+        _fakeApi{.func = Api_InitializeCriticalSectionEx, .paramCount = 3};
+    auto FakeApi_DeleteCriticalSection =
+        _fakeApi{.func = Api_DeleteCriticalSection, .paramCount = 1};
+    auto FakeApi_TlsAlloc = _fakeApi{.func = Api_TlsAlloc, .paramCount = 0};
+    auto FakeApi_TlsSetValue =
+        _fakeApi{.func = Api_TlsSetValue, .paramCount = 2};
+    auto FakeApi_IsProcessorFeaturePresent =
+        _fakeApi{.func = Api_IsProcessorFeaturePresent, .paramCount = 1};
+    auto FakeApi_GetProcAddress =
+        _fakeApi{.func = Api_GetProcAddress, .paramCount = 2};
+    auto FakeApi_GetProcessHeap =
+        _fakeApi{.func = Api_GetProcessHeap, .paramCount = 0};
+    auto FakeApi_HeapAlloc = _fakeApi{.func = Api_HeapAlloc, .paramCount = 3};
+    auto FakeApi_HeapFree = _fakeApi{.func = Api_HeapFree, .paramCount = 3};
+    auto FakeApi_TlsGetValue =
+        _fakeApi{.func = Api_TlsGetValue, .paramCount = 1};
+    auto FakeApi_SetLastError =
+        _fakeApi{.func = Api_SetLastError, .paramCount = 1};
+    auto FakeApi_EnterCriticalSection =
+        _fakeApi{.func = Api_EnterCriticalSection, .paramCount = 1};
+    auto FakeApi_LeaveCriticalSection =
+        _fakeApi{.func = Api_LeaveCriticalSection, .paramCount = 1};
+    auto FakeApi_GetStartupInfoW =
+        _fakeApi{.func = Api_GetStartupInfoW, .paramCount = 1};
+    auto FakeApi_GetStdHandle =
+        _fakeApi{.func = Api_GetStdHandle, .paramCount = 1};
+    auto FakeApi_GetFileType =
+        _fakeApi{.func = Api_GetFileType, .paramCount = 1};
+    auto FakeApi_GetCommandLineA =
+        _fakeApi{.func = Api_GetCommandLineA, .paramCount = 0};
+    auto FakeApi_GetCommandLineW =
+        _fakeApi{.func = Api_GetCommandLineW, .paramCount = 0};
+    auto FakeApi_GetACP = _fakeApi{.func = Api_GetACP, .paramCount = 0};
+    auto FakeApi_GetCPInfo = _fakeApi{.func = Api_GetCPInfo, .paramCount = 2};
+    auto FakeApi_MultiByteToWideChar =
+        _fakeApi{.func = Api_MultiByteToWideChar, .paramCount = 6};
+    auto FakeApi_GetModuleFileNameW =
+        _fakeApi{.func = Api_GetModuleFileNameW, .paramCount = 3};
+    auto FakeApi_AreFileApisANSI =
+        _fakeApi{.func = Api_AreFileApisANSI, .paramCount = 0};
+    auto FakeApi_WideCharToMultiByte =
+        _fakeApi{.func = Api_WideCharToMultiByte, .paramCount = 8};
+    auto FakeApi_InitializeSListHead =
+        _fakeApi{.func = Api_InitializeSListHead, .paramCount = 1};
+    auto FakeApi_GetEnvironmentStringsW =
+        _fakeApi{.func = Api_GetEnvironmentStringsW, .paramCount = 0};
+    auto FakeApi_FreeEnvironmentStringsW =
+        _fakeApi{.func = Api_FreeEnvironmentStringsW, .paramCount = 1};
+    auto FakeApi_SetUnhandledExceptionFilter =
+        _fakeApi{.func = Api_SetUnhandledExceptionFilter, .paramCount = 1};
+    auto FakeApi_VirtualProtect =
+        _fakeApi{.func = Api_VirtualProtect, .paramCount = 4};
+    auto FakeApi_RegOpenKeyExW =
+        _fakeApi{.func = Api_RegOpenKeyExW, .paramCount = 5};
+    auto FakeApi_RegCloseKey =
+        _fakeApi{.func = Api_RegCloseKey, .paramCount = 1};
+    auto FakeApi___set_app_type =
+        _fakeApi{.func = Api___set_app_type, .paramCount = 1};
+    auto FakeApi___p__fmode = _fakeApi{.func = Api___p__fmode, .paramCount = 0};
+    auto FakeApi_Sleep = _fakeApi{.func = Api_Sleep, .paramCount = 1};
+    auto FakeApi_SHGetKnownFolderPath =
+        _fakeApi{.func = Api_SHGetKnownFolderPath, .paramCount = 4};
+    // 添加新的Internet API函数
+    auto FakeApi_InternetOpenA =
+        _fakeApi{.func = Api_InternetOpenA, .paramCount = 5};
+    auto FakeApi_InternetOpenUrlA =
+        _fakeApi{.func = Api_InternetOpenUrlA, .paramCount = 6};
+    auto FakeApi_InternetCloseHandle =
+        _fakeApi{.func = Api_InternetCloseHandle, .paramCount = 1};
+    auto FakeApi_InternetReadFile =
+        _fakeApi{.func = Api_InternetReadFile, .paramCount = 4};
+    auto FakeApi_EncodePointer =
+        _fakeApi{.func = Api_EncodePointer, .paramCount = 1};
+    auto FakeApi_HeapCreate = _fakeApi{.func = Api_HeapCreate, .paramCount = 3};
+    auto FakeApi_GetModuleHandleA =
+        _fakeApi{.func = Api_GetModuleHandleA, .paramCount = 1};
+    auto FakeApi_GetModuleHandleW =
+        _fakeApi{.func = Api_GetModuleHandleW, .paramCount = 1};
+    auto FakeApi_VirtualQuery =
+        _fakeApi{.func = Api_VirtualQuery, .paramCount = 3};
+    auto FakeApi_Process32FirstW =
+        _fakeApi{.func = Api_Process32FirstW, .paramCount = 2};
+    auto FakeApi_CreateToolhelp32Snapshot =
+        _fakeApi{.func = Api_CreateToolhelp32Snapshot, .paramCount = 2};
+    auto FakeApi_Process32NextW =
+        _fakeApi{.func = Api_Process32NextW, .paramCount = 2};
+    auto FakeApi_CloseHandle =
+        _fakeApi{.func = Api_CloseHandle, .paramCount = 1};
+    auto FakeApi_RtlFormatCurrentUserKeyPath =
+        _fakeApi{.func = Api_RtlFormatCurrentUserKeyPath, .paramCount = 1};
+    auto FakeApi_FlsSetValue =
+        _fakeApi{.func = Api_FlsSetValue, .paramCount = 2};
+    auto FakeApi_CreatePipe = _fakeApi{.func = Api_CreatePipe, .paramCount = 4};
+    auto FakeApi_CreateProcessA =
+        _fakeApi{.func = Api_CreateProcessA, .paramCount = 10};
+    auto FakeApi_CreateProcessW =
+        _fakeApi{.func = Api_CreateProcessW, .paramCount = 10};
+    auto FakeApi_ReadFile = _fakeApi{.func = Api_ReadFile, .paramCount = 5};
+    auto FakeApi_WlanOpenHandle =
+        _fakeApi{.func = Api_WlanOpenHandle, .paramCount = 4};
+    auto FakeApi_WlanEnumInterfaces =
+        _fakeApi{.func = Api_WlanEnumInterfaces, .paramCount = 3};
+    auto FakeApi_WlanGetProfileList =
+        _fakeApi{.func = Api_WlanGetProfileList, .paramCount = 4};
+    auto FakeApi_WlanFreeMemory =
+        _fakeApi{.func = Api_WlanFreeMemory, .paramCount = 1};
+    auto FakeApi_WlanCloseHandle =
+        _fakeApi{.func = Api_WlanCloseHandle, .paramCount = 2};
+    auto FakeApi_GetCurrentProcess =
+        _fakeApi{.func = Api_GetCurrentProcess, .paramCount = 0};
+    auto FakeApi_OpenProcessToken =
+        _fakeApi{.func = Api_OpenProcessToken, .paramCount = 3};
+    auto FakeApi_GetTokenInformation =
+        _fakeApi{.func = Api_GetTokenInformation, .paramCount = 5};
+    // 添加WFP相关API
+    auto FakeApi_FwpmEngineOpen0 =
+        _fakeApi{.func = Api_FwpmEngineOpen0, .paramCount = 5};
+    auto FakeApi_FwpmProviderAdd0 =
+        _fakeApi{.func = Api_FwpmProviderAdd0, .paramCount = 3};
+    auto FakeApi_FwpmFilterAdd0 =
+        _fakeApi{.func = Api_FwpmFilterAdd0, .paramCount = 4};
+    auto FakeApi_FwpmEngineClose0 =
+        _fakeApi{.func = Api_FwpmEngineClose0, .paramCount = 1};
+    auto FakeApi_OpenThreadToken =
+        _fakeApi{.func = Api_OpenThreadToken, .paramCount = 4};
+    auto FakeApi_LookupPrivilegeValueA =
+        _fakeApi{.func = Api_LookupPrivilegeValueA, .paramCount = 3};
+    auto FakeApi_AdjustTokenPrivileges =
+        _fakeApi{.func = Api_AdjustTokenPrivileges, .paramCount = 6};
+    auto FakeApi_CreateDirectoryW =
+        _fakeApi{.func = Api_CreateDirectoryW, .paramCount = 2};
+    auto FakeApi_URLDownloadToFileW =
+        _fakeApi{.func = Api_URLDownloadToFileW, .paramCount = 5};
+    auto FakeApi_TlsFree = _fakeApi{.func = Api_TlsFree, .paramCount = 1};
+    auto FakeApi_FlsAlloc = _fakeApi{.func = Api_FlsAlloc, .paramCount = 1};
+    auto FakeApi_FlsGetValue =
+        _fakeApi{.func = Api_FlsGetValue, .paramCount = 1};
+    auto FakeApi_GetStringTypeW =
+        _fakeApi{.func = Api_GetStringTypeW, .paramCount = 4};
+    auto FakeApi_LCMapStringW =
+        _fakeApi{.func = Api_LCMapStringW, .paramCount = 6};
+    auto FakeApi__initterm_e =
+        _fakeApi{.func = Api__initterm_e, .paramCount = 2};
+    auto FakeApi_getenv = _fakeApi{.func = Api_getenv, .paramCount = 1};
+    // 添加COM API
+    auto FakeApi_CoInitializeEx =
+        _fakeApi{.func = Api_CoInitializeEx, .paramCount = 2};
+    auto FakeApi_CoCreateInstance =
+        _fakeApi{.func = Api_CoCreateInstance, .paramCount = 5};
+    auto FakeApi_VariantInit =
+        _fakeApi{.func = Api_VariantInit, .paramCount = 1};
+    auto FakeApi_VariantClear =
+        _fakeApi{.func = Api_VariantClear, .paramCount = 1};
+    auto FakeApi_SysAllocString =
+        _fakeApi{.func = Api_SysAllocString, .paramCount = 1};
+
+    api_map = {
+        {"GetSystemTimeAsFileTime",
+         std::make_shared<_fakeApi>(FakeApi_GetSystemTimeAsFileTime)},
+        {"GetCurrentThreadId",
+         std::make_shared<_fakeApi>(FakeApi_GetCurrentThreadId)},
+        {"GetCurrentProcessId",
+         std::make_shared<_fakeApi>(FakeApi_GetCurrentProcessId)},
+        {"GetCurrentThread",
+         std::make_shared<_fakeApi>(FakeApi_GetCurrentThread)},
+        {"QueryPerformanceCounter",
+         std::make_shared<_fakeApi>(FakeApi_QueryPerformanceCounter)},
+        {"LoadLibraryA", std::make_shared<_fakeApi>(FakeApi_LoadLibraryA)},
+        {"LoadLibraryExW", std::make_shared<_fakeApi>(FakeApi_LoadLibraryExW)},
+        {"GetLastError", std::make_shared<_fakeApi>(FakeApi_GetLastError)},
+        {"InitializeCriticalSectionAndSpinCount",
+         std::make_shared<_fakeApi>(
+             FakeApi_InitializeCriticalSectionAndSpinCount)},
+        {"InitializeCriticalSectionEx",
+         std::make_shared<_fakeApi>(FakeApi_InitializeCriticalSectionEx)},
+        {"DeleteCriticalSection",
+         std::make_shared<_fakeApi>(FakeApi_DeleteCriticalSection)},
+        {"TlsAlloc", std::make_shared<_fakeApi>(FakeApi_TlsAlloc)},
+        {"TlsSetValue", std::make_shared<_fakeApi>(FakeApi_TlsSetValue)},
+        {"IsProcessorFeaturePresent",
+         std::make_shared<_fakeApi>(FakeApi_IsProcessorFeaturePresent)},
+        {"GetProcAddress", std::make_shared<_fakeApi>(FakeApi_GetProcAddress)},
+        {"GetProcessHeap", std::make_shared<_fakeApi>(FakeApi_GetProcessHeap)},
+        {"HeapAlloc", std::make_shared<_fakeApi>(FakeApi_HeapAlloc)},
+        {"HeapFree", std::make_shared<_fakeApi>(FakeApi_HeapFree)},
+        {"TlsGetValue", std::make_shared<_fakeApi>(FakeApi_TlsGetValue)},
+        {"SetLastError", std::make_shared<_fakeApi>(FakeApi_SetLastError)},
+        {"EnterCriticalSection",
+         std::make_shared<_fakeApi>(FakeApi_EnterCriticalSection)},
+        {"LeaveCriticalSection",
+         std::make_shared<_fakeApi>(FakeApi_LeaveCriticalSection)},
+        {"GetStartupInfoW",
+         std::make_shared<_fakeApi>(FakeApi_GetStartupInfoW)},
+        {"GetStdHandle", std::make_shared<_fakeApi>(FakeApi_GetStdHandle)},
+        {"GetFileType", std::make_shared<_fakeApi>(FakeApi_GetFileType)},
+        {"GetCommandLineA",
+         std::make_shared<_fakeApi>(FakeApi_GetCommandLineA)},
+        {"GetCommandLineW",
+         std::make_shared<_fakeApi>(FakeApi_GetCommandLineW)},
+        {"GetACP", std::make_shared<_fakeApi>(FakeApi_GetACP)},
+        {"GetCPInfo", std::make_shared<_fakeApi>(FakeApi_GetCPInfo)},
+        {"MultiByteToWideChar",
+         std::make_shared<_fakeApi>(FakeApi_MultiByteToWideChar)},
+        {"GetModuleFileNameW",
+         std::make_shared<_fakeApi>(FakeApi_GetModuleFileNameW)},
+        {"AreFileApisANSI",
+         std::make_shared<_fakeApi>(FakeApi_AreFileApisANSI)},
+        {"WideCharToMultiByte",
+         std::make_shared<_fakeApi>(FakeApi_WideCharToMultiByte)},
+        {"InitializeSListHead",
+         std::make_shared<_fakeApi>(FakeApi_InitializeSListHead)},
+        {"GetEnvironmentStringsW",
+         std::make_shared<_fakeApi>(FakeApi_GetEnvironmentStringsW)},
+        {"FreeEnvironmentStringsW",
+         std::make_shared<_fakeApi>(FakeApi_FreeEnvironmentStringsW)},
+        {"SetUnhandledExceptionFilter",
+         std::make_shared<_fakeApi>(FakeApi_SetUnhandledExceptionFilter)},
+        {"VirtualProtect", std::make_shared<_fakeApi>(FakeApi_VirtualProtect)},
+        {"RegOpenKeyExW", std::make_shared<_fakeApi>(FakeApi_RegOpenKeyExW)},
+        {"RegCloseKey", std::make_shared<_fakeApi>(FakeApi_RegCloseKey)},
+        {"_set_app_type", std::make_shared<_fakeApi>(FakeApi___set_app_type)},
+        {"_p__fmode", std::make_shared<_fakeApi>(FakeApi___p__fmode)},
+        {"Sleep", std::make_shared<_fakeApi>(FakeApi_Sleep)},
+        {"SHGetKnownFolderPath",
+         std::make_shared<_fakeApi>(FakeApi_SHGetKnownFolderPath)},
+        // 添加新的Internet API映射
+        {"InternetOpenA", std::make_shared<_fakeApi>(FakeApi_InternetOpenA)},
+        {"InternetOpenUrlA",
+         std::make_shared<_fakeApi>(FakeApi_InternetOpenUrlA)},
+        {"InternetCloseHandle",
+         std::make_shared<_fakeApi>(FakeApi_InternetCloseHandle)},
+        {"InternetReadFile",
+         std::make_shared<_fakeApi>(FakeApi_InternetReadFile)},
+        {"EncodePointer", std::make_shared<_fakeApi>(FakeApi_EncodePointer)},
+        {"HeapCreate", std::make_shared<_fakeApi>(FakeApi_HeapCreate)},
+        {"GetModuleHandleA",
+         std::make_shared<_fakeApi>(FakeApi_GetModuleHandleA)},
+        {"GetModuleHandleW",
+         std::make_shared<_fakeApi>(FakeApi_GetModuleHandleW)},
+        {"VirtualQuery", std::make_shared<_fakeApi>(FakeApi_VirtualQuery)},
+        {"Process32FirstW",
+         std::make_shared<_fakeApi>(FakeApi_Process32FirstW)},
+        {"CreateToolhelp32Snapshot",
+         std::make_shared<_fakeApi>(FakeApi_CreateToolhelp32Snapshot)},
+        {"Process32NextW", std::make_shared<_fakeApi>(FakeApi_Process32NextW)},
+        {"CloseHandle", std::make_shared<_fakeApi>(FakeApi_CloseHandle)},
+        {"RtlFormatCurrentUserKeyPath",
+         std::make_shared<_fakeApi>(FakeApi_RtlFormatCurrentUserKeyPath)},
+        {"FlsSetValue", std::make_shared<_fakeApi>(FakeApi_FlsSetValue)},
+        {"CreatePipe", std::make_shared<_fakeApi>(FakeApi_CreatePipe)},
+        {"CreateProcessA", std::make_shared<_fakeApi>(FakeApi_CreateProcessA)},
+        {"CreateProcessW", std::make_shared<_fakeApi>(FakeApi_CreateProcessW)},
+        {"ReadFile", std::make_shared<_fakeApi>(FakeApi_ReadFile)},
+        {"WlanOpenHandle", std::make_shared<_fakeApi>(FakeApi_WlanOpenHandle)},
+        {"WlanEnumInterfaces",
+         std::make_shared<_fakeApi>(FakeApi_WlanEnumInterfaces)},
+        {"WlanGetProfileList",
+         std::make_shared<_fakeApi>(FakeApi_WlanGetProfileList)},
+        {"WlanFreeMemory", std::make_shared<_fakeApi>(FakeApi_WlanFreeMemory)},
+        {"WlanCloseHandle",
+         std::make_shared<_fakeApi>(FakeApi_WlanCloseHandle)},
+        {"GetCurrentProcess",
+         std::make_shared<_fakeApi>(FakeApi_GetCurrentProcess)},
+        {"OpenProcessToken",
+         std::make_shared<_fakeApi>(FakeApi_OpenProcessToken)},
+        {"GetTokenInformation",
+         std::make_shared<_fakeApi>(FakeApi_GetTokenInformation)},
+        {"OpenThreadToken",
+         std::make_shared<_fakeApi>(FakeApi_OpenThreadToken)},
+        // 添加WFP相关API映射
+        {"FwpmEngineOpen0",
+         std::make_shared<_fakeApi>(FakeApi_FwpmEngineOpen0)},
+        {"FwpmProviderAdd0",
+         std::make_shared<_fakeApi>(FakeApi_FwpmProviderAdd0)},
+        {"FwpmFilterAdd0", std::make_shared<_fakeApi>(FakeApi_FwpmFilterAdd0)},
+        {"FwpmEngineClose0",
+         std::make_shared<_fakeApi>(FakeApi_FwpmEngineClose0)},
+        {"LookupPrivilegeValueA",
+         std::make_shared<_fakeApi>(FakeApi_LookupPrivilegeValueA)},
+        {"AdjustTokenPrivileges",
+         std::make_shared<_fakeApi>(FakeApi_AdjustTokenPrivileges)},
+        {"CreateDirectoryW",
+         std::make_shared<_fakeApi>(FakeApi_CreateDirectoryW)},
+        {"URLDownloadToFileW",
+         std::make_shared<_fakeApi>(FakeApi_URLDownloadToFileW)},
+        {"TlsFree", std::make_shared<_fakeApi>(FakeApi_TlsFree)},
+        {"FlsAlloc", std::make_shared<_fakeApi>(FakeApi_FlsAlloc)},
+        {"FlsGetValue", std::make_shared<_fakeApi>(FakeApi_FlsGetValue)},
+        {"_initterm_e", std::make_shared<_fakeApi>(FakeApi__initterm_e)},
+        {"GetStringTypeW", std::make_shared<_fakeApi>(FakeApi_GetStringTypeW)},
+        {"LCMapStringW", std::make_shared<_fakeApi>(FakeApi_LCMapStringW)},
+        {"getenv", std::make_shared<_fakeApi>(FakeApi_getenv)},
+        {"CoInitializeEx", std::make_shared<_fakeApi>(FakeApi_CoInitializeEx)},
+        {"CoCreateInstance",
+         std::make_shared<_fakeApi>(FakeApi_CoCreateInstance)},
+        {"VariantInit", std::make_shared<_fakeApi>(FakeApi_VariantInit)},
+        {"VariantClear", std::make_shared<_fakeApi>(FakeApi_VariantClear)},
+        {"SysAllocString", std::make_shared<_fakeApi>(FakeApi_SysAllocString)},
+    };
+}
+auto Sandbox::EmulateApi(uc_engine* uc, uint64_t address, uint64_t rip,
+                         std::string ApiName) -> bool {
+    auto it = api_map.find(ApiName);
+    if (it != api_map.end()) {
+        it->second->func(this, uc, address);
+
+        this->ApiCallList.push_back(ApiName);
+        // 获取参数数量
+        int paramCount = it->second->paramCount;
+        uint32_t esp;
+        uint64_t rsp;
+
+        // 从栈上读取返回地址
+        uint64_t return_address;
+        if (this->GetPeInfo()->isX64) {  // 64位系统
+            uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+            // 读取8字节的返回地址
+            uc_mem_read(uc, rsp, &return_address, 8);
+
+            // x64下，前4个参数通过寄存器传递，超过的部分通过栈传递
+            // int stack_params = (paramCount > 4) ? (paramCount - 4) : 0;
+            // 调整栈指针：每个参数8字节 + 返回地址8字节
+            // rsp += (stack_params * 8) + 8;
+            rsp += 8;
+            // 设置RIP为返回地址
+            uc_reg_write(uc, UC_X86_REG_RIP, &return_address);
+            printf("ApiName set ip: %llx \n", return_address);
+
+        } else {  // 32位系统
+            // 读取4字节的返回地址
+            uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+            uc_mem_read(uc, esp, &return_address, 4);
+
+            uint32_t return_address_32;
+            uc_mem_read(uc, esp, &return_address_32, 4);
+            printf("return_address_32: %x\n", return_address_32);
+            // x86下，所有参数都通过栈传递
+            // 调整栈指针：每个参数4字节 + 返回地址4字节
+            esp += (paramCount * 4) + 4;
+            // esp += 4;
+            //  设置EIP为返回地址
+            uc_reg_write(uc, UC_X86_REG_EIP, &return_address_32);
+        }
+        if (this->GetPeInfo()->isX64) {
+            uc_reg_write(uc, UC_X86_REG_RSP, &rsp);
+        } else {
+            uc_reg_write(uc, UC_X86_REG_ESP, &esp);
+        }
+
+        return true;
+    }
+    printf("ApiName: %s not found\n", ApiName.c_str());
+    uc_emu_stop(uc);
+    return false;
+}

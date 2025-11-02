@@ -1,0 +1,478 @@
+#include "sandbox.h"
+#include <windows.h>
+#include <wininet.h>
+#include <algorithm>
+
+// 函数声明，确保外部可见
+extern auto Api_InternetOpenA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+extern auto Api_InternetOpenUrlA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+extern auto Api_InternetCloseHandle(void* sandbox, uc_engine* uc,
+                                    uint64_t address) -> void;
+extern auto Api_InternetReadFile(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void;
+
+// 模拟InternetOpenA API
+auto Api_InternetOpenA(void* sandbox, uc_engine* uc, uint64_t address) -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // 获取参数
+    uint64_t lpszAgent = 0;
+    uint64_t dwAccessType = 0;
+    uint64_t lpszProxy = 0;
+    uint64_t lpszProxyBypass = 0;
+    uint32_t dwFlags = 0;
+
+    // 根据x86或x64架构读取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &lpszAgent);
+        uc_reg_read(uc, UC_X86_REG_RDX, &dwAccessType);
+        uc_reg_read(uc, UC_X86_REG_R8, &lpszProxy);
+        uc_reg_read(uc, UC_X86_REG_R9, &lpszProxyBypass);
+
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp + 0x28, &dwFlags, sizeof(dwFlags));
+    } else {
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+
+        uint32_t param_addr = esp + 4;
+        uc_mem_read(uc, param_addr, &lpszAgent, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwAccessType, sizeof(dwAccessType));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpszProxy, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpszProxyBypass, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwFlags, sizeof(dwFlags));
+    }
+
+    // 读取用户代理字符串
+    std::string agentString;
+    if (lpszAgent != 0) {
+        char buffer[256] = {0};
+        uc_mem_read(uc, lpszAgent, buffer, sizeof(buffer) - 1);
+        agentString = buffer;
+
+        // 检查用户代理是否可疑
+        const std::vector<std::string> suspiciousAgents = {
+            "wget",    "curl",       "python",  "go-http",
+            "perl",    "powershell", "winhttp", "urlmon",
+            "mozilla", "edge",       "chrome",  "internet explorer"};
+
+        for (const auto& agent : suspiciousAgents) {
+            std::string lowerAgent = agentString;
+            // 转换为小写进行比较
+            std::transform(lowerAgent.begin(), lowerAgent.end(),
+                           lowerAgent.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+
+            if (lowerAgent.find(agent) != std::string::npos) {
+                context->SetMalwareAnalysisType(
+                    MalwareAnalysisType::kSuspicious);
+#if LOG_LEVEL >= 1
+                printf("[!!!] Suspicious User-Agent: %s\n",
+                       agentString.c_str());
+#endif
+                break;
+            }
+        }
+    }
+
+    // 分配新的Internet句柄
+    uint64_t handleValue = context->GetNextInternetHandle();
+
+    // 在实际创建句柄之前进行检查
+    if (dwAccessType == INTERNET_OPEN_TYPE_PROXY && lpszProxy != 0) {
+        char proxyBuffer[256] = {0};
+        uc_mem_read(uc, lpszProxy, proxyBuffer, sizeof(proxyBuffer) - 1);
+        std::string proxyString = proxyBuffer;
+
+        // 检查代理设置是否可疑
+        if (!proxyString.empty()) {
+            context->SetMalwareAnalysisType(MalwareAnalysisType::kSuspicious);
+#if LOG_LEVEL >= 1
+            printf("[!!!] Suspicious proxy configuration: %s\n",
+                   proxyString.c_str());
+#endif
+        }
+    }
+
+    // 创建句柄信息
+    InternetHandleInfo handleInfo;
+    handleInfo.handle = (HINTERNET)handleValue;
+    handleInfo.isConnection = false;
+    context->AddInternetHandle(handleValue, handleInfo);
+
+    // 设置返回值
+    uint64_t returnValue = handleValue;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &returnValue);
+}
+
+// 模拟InternetOpenUrlA API
+auto Api_InternetOpenUrlA(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // 获取参数
+    uint64_t hInternet = 0;
+    uint64_t lpszUrl = 0;
+    uint64_t lpszHeaders = 0;
+    uint64_t dwHeadersLength = 0;
+    uint64_t dwFlags = 0;
+    uint64_t dwContext = 0;
+
+    // 根据x86或x64架构读取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &hInternet);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpszUrl);
+        uc_reg_read(uc, UC_X86_REG_R8, &lpszHeaders);
+        uc_reg_read(uc, UC_X86_REG_R9, &dwHeadersLength);
+
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp + 0x28, &dwFlags, sizeof(dwFlags));
+        uc_mem_read(uc, rsp + 0x30, &dwContext, sizeof(dwContext));
+    } else {
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+
+        uint32_t param_addr = esp + 4;
+        uc_mem_read(uc, param_addr, &hInternet, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpszUrl, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpszHeaders, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwHeadersLength, sizeof(dwHeadersLength));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwFlags, sizeof(dwFlags));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwContext, sizeof(uint32_t));
+    }
+    context->SetMalwareAnalysisType(MalwareAnalysisType::kMalware);
+
+    // 读取URL字符串
+    std::string urlString;
+    if (lpszUrl != 0) {
+        char buffer[1024] = {0};
+        uc_mem_read(uc, lpszUrl, buffer, sizeof(buffer) - 1);
+        urlString = buffer;
+    }
+    printf("urlString: %s\n", urlString.c_str());
+
+    // 检查Internet句柄是否有效
+    if (context->GetInternetHandle(hInternet) == nullptr) {
+        // 无效句柄，返回NULL
+        uint64_t returnValue = 0;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &returnValue);
+        return;
+    }
+
+    // 分配新的URL连接句柄
+    uint64_t handleValue = context->GetNextInternetHandle();
+
+    // 创建句柄信息
+    InternetHandleInfo handleInfo;
+    handleInfo.handle = (HINTERNET)handleValue;
+    handleInfo.isConnection = true;
+    handleInfo.url = urlString;
+    // 生成模拟响应数据
+    // 这块可以真实请求,然后看是不是PE文件之类的.
+    const char* sampleResponse =
+        "HTTP/1.1 200 OK\r\nContent-Type: "
+        "text/html\r\n\r\n<html><body>huoji own me and all</body></html>";
+    handleInfo.responseData.assign(sampleResponse,
+                                   sampleResponse + strlen(sampleResponse));
+    handleInfo.currentPosition = 0;
+
+    context->AddInternetHandle(handleValue, handleInfo);
+
+    // 设置返回值
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &handleValue);
+}
+
+// 模拟InternetCloseHandle API
+auto Api_InternetCloseHandle(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // 获取参数
+    uint64_t hInternet = 0;
+
+    // 根据x86或x64架构读取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &hInternet);
+    } else {
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+
+        uint32_t param_addr = esp + 4;
+        uc_mem_read(uc, param_addr, &hInternet, sizeof(uint32_t));
+    }
+
+    // 检查句柄是否有效
+    bool handleValid = (context->GetInternetHandle(hInternet) != nullptr);
+
+    // 如果句柄有效，移除它
+    if (handleValid) {
+        context->RemoveInternetHandle(hInternet);
+    }
+
+    // 设置返回值（成功或失败）
+    uint32_t returnValue = handleValid ? TRUE : FALSE;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &returnValue);
+}
+
+// 模拟InternetReadFile API
+auto Api_InternetReadFile(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // 获取参数
+    uint64_t hFile = 0;
+    uint64_t lpBuffer = 0;
+    uint32_t dwNumberOfBytesToRead = 0;
+    uint64_t lpdwNumberOfBytesRead = 0;
+
+    // 根据x86或x64架构读取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &hFile);
+        uc_reg_read(uc, UC_X86_REG_RDX, &lpBuffer);
+        uc_reg_read(uc, UC_X86_REG_R8, &dwNumberOfBytesToRead);
+        uc_reg_read(uc, UC_X86_REG_R9, &lpdwNumberOfBytesRead);
+    } else {
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+
+        uint32_t param_addr = esp + 4;
+        uc_mem_read(uc, param_addr, &hFile, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpBuffer, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwNumberOfBytesToRead,
+                    sizeof(dwNumberOfBytesToRead));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpdwNumberOfBytesRead, sizeof(uint32_t));
+    }
+
+    // 检查句柄是否有效
+    auto it = context->GetInternetHandle(hFile);
+    if (it == nullptr || !it->isConnection) {
+        // 无效句柄，设置失败状态
+        uint32_t returnValue = FALSE;
+        uc_reg_write(
+            uc, context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+            &returnValue);
+        return;
+    }
+
+    // 获取句柄信息
+    InternetHandleInfo& handleInfo = *it;
+
+    // 计算实际要读取的字节数
+    uint32_t bytesToRead = dwNumberOfBytesToRead;
+    if (handleInfo.currentPosition + bytesToRead >
+        handleInfo.responseData.size()) {
+        bytesToRead = (uint32_t)(handleInfo.responseData.size() -
+                                 handleInfo.currentPosition);
+    }
+
+    // 检查响应数据中是否包含恶意内容
+    if (bytesToRead > 0) {
+        std::string dataChunk(
+            handleInfo.responseData.begin() + handleInfo.currentPosition,
+            handleInfo.responseData.begin() + handleInfo.currentPosition +
+                bytesToRead);
+
+        // 检查响应数据是否包含可疑内容
+        const std::vector<std::string> suspiciousResponsePatterns = {
+            "powershell",     "cmd.exe",      "eval(",      "exec(",
+            "system(",        "shell_exec",   "<script",    "function()",
+            "document.write", "base64",       "FromBase64", "CreateObject",
+            "WScript",        "ActiveXObject"};
+
+        for (const auto& pattern : suspiciousResponsePatterns) {
+            if (dataChunk.find(pattern) != std::string::npos) {
+                context->SetMalwareAnalysisType(
+                    MalwareAnalysisType::kSuspicious);
+#if LOG_LEVEL >= 1
+                printf("[!!!] Suspicious content in HTTP response: %s\n",
+                       pattern.c_str());
+#endif
+                break;
+            }
+        }
+    }
+
+    // 将数据写入缓冲区
+    if (bytesToRead > 0) {
+        uc_mem_write(
+            uc, lpBuffer,
+            handleInfo.responseData.data() + handleInfo.currentPosition,
+            bytesToRead);
+
+        // 更新当前位置
+        handleInfo.currentPosition += bytesToRead;
+    }
+
+    // 写入读取的字节数
+    uc_mem_write(uc, lpdwNumberOfBytesRead, &bytesToRead, sizeof(bytesToRead));
+
+    // 设置返回值（成功）
+    uint32_t returnValue = TRUE;
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &returnValue);
+}
+
+auto Api_URLDownloadToFileW(void* sandbox, uc_engine* uc, uint64_t address)
+    -> void {
+    auto context = static_cast<Sandbox*>(sandbox);
+
+    // 获取参数
+    uint64_t pCaller = 0;     // LPUNKNOWN pCaller
+    uint64_t szURL = 0;       // LPCWSTR szURL
+    uint64_t szFileName = 0;  // LPCWSTR szFileName
+    uint64_t dwReserved = 0;  // DWORD dwReserved
+    uint64_t lpfnCB = 0;      // LPBINDSTATUSCALLBACK lpfnCB
+
+    // 根据x86或x64架构读取参数
+    if (context->GetPeInfo()->isX64) {
+        uc_reg_read(uc, UC_X86_REG_RCX, &pCaller);
+        uc_reg_read(uc, UC_X86_REG_RDX, &szURL);
+        uc_reg_read(uc, UC_X86_REG_R8, &szFileName);
+        uc_reg_read(uc, UC_X86_REG_R9, &dwReserved);
+
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp + 0x28, &lpfnCB, sizeof(lpfnCB));
+    } else {
+        uint32_t esp = 0;
+        uc_reg_read(uc, UC_X86_REG_ESP, &esp);
+
+        uint32_t param_addr = esp + 4;
+        uc_mem_read(uc, param_addr, &pCaller, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &szURL, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &szFileName, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &dwReserved, sizeof(uint32_t));
+
+        param_addr += 4;
+        uc_mem_read(uc, param_addr, &lpfnCB, sizeof(uint32_t));
+    }
+
+    // 将此行为标记为可能的恶意行为
+    context->SetMalwareAnalysisType(MalwareAnalysisType::kMalware);
+
+    // 读取URL (宽字符)
+    std::wstring wUrlString;
+    if (szURL != 0) {
+        wchar_t buffer[4096] = {0};
+        // 循环读取URL,每次读取一个wchar_t字符
+        size_t totalRead = 0;
+        const size_t maxSize =
+            sizeof(buffer) - sizeof(wchar_t);  // 预留null终止符空间
+        bool readError = false;
+
+        while (totalRead < maxSize) {
+            wchar_t ch = 0;
+            auto ucError =
+                uc_mem_read(uc, szURL + totalRead, &ch, sizeof(wchar_t));
+
+            if (ucError != UC_ERR_OK) {
+                readError = true;
+                break;
+            }
+
+            // 检查是否遇到宽字符终止符(0x0000)
+            if (ch == 0x0000) {
+                break;
+            }
+
+            buffer[totalRead / sizeof(wchar_t)] = ch;
+            totalRead += sizeof(wchar_t);
+        }
+
+        // 确保字符串以宽字符null结尾
+        buffer[totalRead / sizeof(wchar_t)] = 0x0000;
+
+        if (readError) {
+            printf("[警告] URL读取时发生错误\n");
+            __debugbreak();
+        }
+
+        wUrlString = buffer;
+
+        // 转换为UTF-8字符串用于日志记录
+        std::string urlString(wUrlString.begin(), wUrlString.end());
+        printf("[URLDownloadToFileW] URL: %s\n", urlString.c_str());
+
+        // 记录到API调用列表
+        context->ApiCallList.push_back("URLDownloadToFileW: " + urlString);
+    }
+
+    // 读取文件名 (宽字符)
+    std::wstring wFileNameString;
+    if (szFileName != 0) {
+        wchar_t buffer[1024] = {0};
+        uc_mem_read(uc, szFileName, buffer, sizeof(buffer) - sizeof(wchar_t));
+        wFileNameString = buffer;
+
+        // 转换为UTF-8字符串用于日志记录
+        std::string fileNameString(wFileNameString.begin(),
+                                   wFileNameString.end());
+        printf("[URLDownloadToFileW] File name: %s\n", fileNameString.c_str());
+    }
+
+    // 检查URL是否包含可疑内容
+    const std::vector<std::wstring> suspiciousUrlPatterns = {
+        L"http://", L"https://", L"ftp://", L".exe", L".dll", L".bat",
+        L".ps1",    L".vbs",     L".js",    L".cmd", L".msi", L".hta"};
+
+    for (const auto& pattern : suspiciousUrlPatterns) {
+        if (wUrlString.find(pattern) != std::wstring::npos) {
+            context->SetMalwareAnalysisType(MalwareAnalysisType::kMalware);
+#if LOG_LEVEL >= 1
+            std::string patternString(pattern.begin(), pattern.end());
+            printf("[!!!] Malicious URL pattern detected: %s\n",
+                   patternString.c_str());
+#endif
+            break;
+        }
+    }
+
+    // 模拟下载成功
+    uint32_t returnValue = S_OK;  // 0 表示成功
+    uc_reg_write(uc,
+                 context->GetPeInfo()->isX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX,
+                 &returnValue);
+}
